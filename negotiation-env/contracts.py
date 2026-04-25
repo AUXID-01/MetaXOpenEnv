@@ -141,9 +141,23 @@ STEP_RESPONSE_INFO_KEYS: list[str] = [
     "trust_after",           # float — quick access without calling /state
     "episode_id",            # str  — UUID, same as in Observation
 ]
-# Person A: api/routes.py populates all of these in StepResponse.info
-# Person C: ClientStepResult.from_http() reads all of these by name
-# RULE: If A adds a new info key, A adds it here. C reads from this list.
+
+# ────────────────────────────────────────────────────────────
+# SECTION 5.1 — OBSERVATION SCHEMA
+# Locked across Person A (builds it) and Person C (LLM prompt)
+# ────────────────────────────────────────────────────────────
+
+OBSERVATION_SCHEMA: dict[str, str] = {
+    "turn"             : "int — current turn count (starting from 1)",
+    "borrower_msg"     : "str — exact text from the borrower response",
+    "escalation_level" : "float — visible anger level (0.0 to 10.0)",
+    "stated_demands"   : "list[str] — demands revealed by borrower so far",
+    "turns_remaining"  : "int — steps left before timeout failure",
+    "profile_context"  : "str — non-sensitive borrower details (e.g. name, type)",
+    "episode_id"       : "str — unique UUID for the session",
+}
+# Person A: models/observation.py and env.py implement this schema
+# Person C: prompt_builder.py uses these keys to build LLM context
 
 
 # ────────────────────────────────────────────────────────────
