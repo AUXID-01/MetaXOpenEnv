@@ -1,0 +1,56 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            5scsehacxxwuwfd20wzbdkg4lqesing0:
+                codePath: negotiation-env\training\train_grpo.py
+                codePathLocal: training\train_grpo.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                cudaVersion: "12.7"
+                disk:
+                    /:
+                        total: "480298471424"
+                        used: "459140440064"
+                email: thirstyexams1990@gmail.com
+                executable: C:\Users\nanda\Desktop\MetaXOpenEnv\negotiation-env\venv\Scripts\python.exe
+                git:
+                    commit: e2edaadf4626b2a8c3e89f2cbf0f37eb654cb84e
+                    remote: https://github.com/AUXID-01/MetaXOpenEnv.git
+                gpu: NVIDIA GeForce RTX 3050 Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 2048
+                      memoryTotal: "4294967296"
+                      name: NVIDIA GeForce RTX 3050 Laptop GPU
+                      uuid: GPU-d2e70b90-d394-103c-e628-1fc15e6cde5e
+                host: LAPTOP-PHLCSEQ1
+                memory:
+                    total: "16989736960"
+                os: Windows-10-10.0.26200-SP0
+                program: C:\Users\nanda\Desktop\MetaXOpenEnv\negotiation-env\training\train_grpo.py
+                python: CPython 3.11.0
+                root: C:\Users\nanda\Desktop\MetaXOpenEnv\negotiation-env
+                startedAt: "2026-04-25T19:41:17.815152Z"
+                writerId: 5scsehacxxwuwfd20wzbdkg4lqesing0
+        m: []
+        python_version: 3.11.0
+        t:
+            "2":
+                - 1
+                - 49
+            "3":
+                - 16
+            "4": 3.11.0
+            "5": 0.26.1
+            "8":
+                - 3
+            "12": 0.26.1
+            "13": windows-amd64
+max_turns:
+    value: 15
+model:
+    value: unsloth/Qwen2.5-1.5B-Instruct
+stage:
+    value: 1

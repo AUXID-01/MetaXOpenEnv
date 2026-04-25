@@ -1,0 +1,40 @@
+{
+  "os":  "Windows-10-10.0.26200-SP0",
+  "python":  "CPython 3.11.0",
+  "startedAt":  "2026-04-25T19:41:17.815152Z",
+  "program":  "C:\\Users\\nanda\\Desktop\\MetaXOpenEnv\\negotiation-env\\training\\train_grpo.py",
+  "codePath":  "negotiation-env\\training\\train_grpo.py",
+  "codePathLocal":  "training\\train_grpo.py",
+  "git":  {
+    "remote":  "https://github.com/AUXID-01/MetaXOpenEnv.git",
+    "commit":  "e2edaadf4626b2a8c3e89f2cbf0f37eb654cb84e"
+  },
+  "email":  "thirstyexams1990@gmail.com",
+  "root":  "C:\\Users\\nanda\\Desktop\\MetaXOpenEnv\\negotiation-env",
+  "host":  "LAPTOP-PHLCSEQ1",
+  "executable":  "C:\\Users\\nanda\\Desktop\\MetaXOpenEnv\\negotiation-env\\venv\\Scripts\\python.exe",
+  "cpu_count":  8,
+  "cpu_count_logical":  16,
+  "gpu":  "NVIDIA GeForce RTX 3050 Laptop GPU",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "480298471424",
+      "used":  "459140440064"
+    }
+  },
+  "memory":  {
+    "total":  "16989736960"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 3050 Laptop GPU",
+      "memoryTotal":  "4294967296",
+      "cudaCores":  2048,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-d2e70b90-d394-103c-e628-1fc15e6cde5e"
+    }
+  ],
+  "cudaVersion":  "12.7",
+  "writerId":  "5scsehacxxwuwfd20wzbdkg4lqesing0"
+}

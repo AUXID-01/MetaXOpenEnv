@@ -13,6 +13,8 @@
 import os
 import sys
 import copy
+from dotenv import load_dotenv
+load_dotenv() # Load WANDB_API_KEY from .env
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from contracts import HF_SPACE_URL
 
@@ -26,44 +28,41 @@ MAX_TURNS = 15
 # %% [markdown]
 # ### Cell 3 — WandB Login
 # %%
-# import wandb
-# wandb.login()
-# wandb.init(project="debt-negotiation-rl", config={
-#     "model": MODEL_NAME,
-#     "max_turns": MAX_TURNS,
-#     "stage": CURRICULUM_STAGE
-# })
+import wandb
+wandb.login()
+wandb.init(project="debt-negotiation-rl", config={
+    "model": MODEL_NAME,
+    "max_turns": MAX_TURNS,
+    "stage": CURRICULUM_STAGE
+})
 
 # %% [markdown]
 # ### Cell 4 — Model Load (Unsloth 4-bit QLoRA)
 # %%
-# from unsloth import FastLanguageModel
-# import torch
-# max_seq_length = 2048
-# load_in_4bit = True 
-# model, tokenizer = FastLanguageModel.from_pretrained(
-#     model_name=MODEL_NAME,
-#     max_seq_length=max_seq_length,
-#     load_in_4bit=load_in_4bit,
-# )
+from unsloth import FastLanguageModel
+import torch
+max_seq_length = 2048
+load_in_4bit = True 
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=MODEL_NAME,
+    max_seq_length=max_seq_length,
+    load_in_4bit=load_in_4bit,
+)
 
 # %% [markdown]
 # ### Cell 5 — Client Setup
 # %%
-from client.env_client import DummyEnvClient, NegotiationEnvClient
-client = DummyEnvClient() # Swap to NegotiationEnvClient(HF_SPACE_URL) when Gate 5 passes
+from environment.env import NegotiationEnv
+client = NegotiationEnv() # Direct instance for zero-latency training
 
 # %% [markdown]
 # ### Pre-Cell 6: Generation Wrapper
 # %%
 def generate_action(prompt: str) -> str:
     """Wrapper to generate text using the loaded unsloth model."""
-    # inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-    # outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
-    # return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0][len(prompt):]
-    
-    # Using local mock to mimic messy model output for now
-    return "Let me check.\n<action_type>send_message</action_type>\n<text>I can help.</text>\n<metadata>{}</metadata>\nThank you."
+    inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+    outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
+    return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0][len(prompt):]
 
 # %% [markdown]
 # ### Cell 6 — Smoke Test (Gate 4)
@@ -163,7 +162,6 @@ grpo_config = GRPOConfig(
 )
 
 # --- Training Loop ---
-"""
 TRAIN_STEPS = 500
 ROLLOUT_EVERY = 50   # collect fresh episodes every N steps
 
@@ -189,5 +187,4 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
     mean_reward_last_100 = sum(reward_window) / max(1, len(reward_window))
     if scheduler.advance_if_ready(mean_reward_last_100):
         print("Advancing curriculum stage!")
-        # CURRICULUM_STAGE += 1 (mock logic depending on your scheduler)
-"""
+        # CURRICULUM_STAGE += 1
