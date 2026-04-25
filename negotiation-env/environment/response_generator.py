@@ -1,11 +1,1006 @@
 # environment/response_generator.py
-from typing import Dict, List, Any
+"""
+HOLDS:
+    1. ResponseGenerator class — Hybrid-Dynamic borrower voice powered by
+       NVIDIA NIM (Llama-3.1-70B-Instruct).  Maps the deterministic emotional
+       state (anger / trust / fear) to an Intersection Archetype, builds a
+       strict "translator" system prompt, queries NIM, and caches by
+       (Archetype, action_type) to keep training latency tractable.
+    2. TEMPLATES + pick_template() — the legacy deterministic template bank,
+       kept as the offline fallback when the NIM API is unavailable
+       (no key, network error, or timeout) and as a back-compat surface for
+       existing tests (tests/test_response_generator.py imports pick_template).
 
+DESIGN INVARIANT — INTERFACE LOCK
+─────────────────────────────────
+The reward signal is computed from the deterministic State (anger, trust,
+fear, demands, terminated, ...) which is mutated by adversary.py PRIOR to
+the borrower text being generated.  The LLM is *only* a translator of that
+state into natural language; it never writes back to State.  This keeps the
+reward function deterministic and reproducible while the dialogue feels
+human.
+
+RUNS:
+    adversary.py -> _generate_response() -> get_response_generator().generate(...)
+
+CONNECTS TO:
+    adversary.py (caller), classifier.py (signal taxonomy aligns with
+    action_type bins below), env.py (consumes the resulting borrower_msg
+    on Observation).
 """
-HOLDS: deterministic template bank for borrower dialogue.
-RUNS: called by adversary.py to generate responses.
-CONNECTS TO: adversary.py.
-"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+import os
+import re
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets management — load `.env` once at module import.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# We use python-dotenv so that NVIDIA_API_KEY (and any future credentials)
+# can live in a project-root `.env` file that is git-ignored.  Calling
+# `load_dotenv()` here is idempotent — repeated calls do not override
+# variables already set in the real environment, which means:
+#
+#   • Shell exports (`NVIDIA_API_KEY=... python ...`) still win, just like
+#     before — required for CI / Docker / Kubernetes deployments where
+#     secrets come from a mounted file or vault rather than .env.
+#   • Local developers can drop a key into the repo's `.env` and run
+#     `python -m pytest` or `python voice_proof_of_life.py` without any
+#     extra `export` step.
+#
+# `find_dotenv()` walks upward from this file's location looking for a
+# `.env`, so the lookup works whether the user runs the env from
+# `negotiation-env/`, the repo root, or some training rig elsewhere.
+try:                                                # pragma: no cover
+    from dotenv import find_dotenv, load_dotenv
+    _ENV_FILE = find_dotenv(usecwd=True)
+    if _ENV_FILE:
+        load_dotenv(_ENV_FILE, override=False)
+except Exception:                                   # pragma: no cover
+    # python-dotenv is in requirements.txt, but failing to import it must
+    # never crash the env at training time — the operator can still export
+    # NVIDIA_API_KEY in their shell, which is how CI does it anyway.
+    _ENV_FILE = ""
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NIM API CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NIM_MODEL    = "meta/llama-3.1-70b-instruct"
+NIM_TIMEOUT_S = 30.0          # hardened: per-request hard ceiling
+NIM_MAX_TOKENS = 90
+NIM_TEMPERATURE = 0.7
+NIM_TOP_P = 0.9
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sentinel placeholder values that ship in `.env` / `.env.example`.  We treat
+# them as "not configured" so a casual `cp .env.example .env` doesn't end up
+# pointing the OpenAI client at the literal string "your_actual_key_here".
+# ─────────────────────────────────────────────────────────────────────────────
+_PLACEHOLDER_KEYS: frozenset[str] = frozenset({
+    "",
+    "your_actual_key_here",
+    "your-actual-key-here",
+    "changeme",
+    "<your-key>",
+    "<your_key_here>",
+    "REPLACE_ME",
+})
+
+
+def _read_nvidia_api_key() -> Optional[str]:
+    """
+    Resolve NVIDIA_API_KEY from the (already-loaded) environment.
+
+    Returns the trimmed key string when one is configured, else None.
+    Empty strings, whitespace-only values, and known placeholder strings
+    from `.env.example` all collapse to None so they cannot accidentally
+    be sent to NVIDIA's API as if they were real credentials.
+    """
+    raw = os.getenv("NVIDIA_API_KEY")
+    if raw is None:
+        return None
+    key = raw.strip()
+    if not key or key.lower() in {p.lower() for p in _PLACEHOLDER_KEYS}:
+        return None
+    return key
+
+
+def require_nvidia_api_key() -> str:
+    """
+    Public helper for callers that *know* they need a real NIM key
+    (e.g. ``voice_proof_of_life.py``).
+
+    Raises a clear, descriptive ``ValueError`` if the key is missing,
+    blank, or still set to the `.env.example` placeholder.  The exception
+    message tells the operator exactly which variable to set and where —
+    this is the contract requested in the secrets-management spec.
+    """
+    key = _read_nvidia_api_key()
+    if key is None:
+        raise ValueError(
+            "NVIDIA_API_KEY is not configured.\n"
+            "  • Copy `.env.example` to `.env` at the project root and fill "
+            "in your real NVIDIA NIM key, or\n"
+            "  • Export it in your shell:  export NVIDIA_API_KEY=nvapi-...\n"
+            "Get a key at https://build.nvidia.com/."
+        )
+    return key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HARDENING CONFIGURATION  (see tests/test_edge_cases.py)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Three independent guards keep the env from crashing during long RL training:
+#
+#   1. NETWORK GUARD  — strict timeout + 3-attempt exponential back-off on
+#                       transient HTTP errors (429 / 500 / 502 / 503 / 504,
+#                       connection drops, read timeouts).  After all retries
+#                       are exhausted we fall through to the legacy template
+#                       bank instead of letting the exception escape.
+#
+#   2. DATA GUARD     — agent_text is truncated to MAX_AGENT_WORDS before it
+#                       reaches the prompt builder; LLM replies that are
+#                       empty, model-refusals ("I cannot ...", "I'm sorry,
+#                       I can't help"), or that leak template placeholders
+#                       ("{loan_amount}") are rejected and replaced with a
+#                       short in-character "sullen" line from the template
+#                       bank — which still sounds like the borrower.
+#
+#   3. BOUNDARY GUARD — every numeric field touched by this module is run
+#                       through `_finite()` before bucketing so NaN / Inf
+#                       can never index into _BUCKET_NAMES or _ARCHETYPES.
+#
+# All three guards are best-effort:  none of them mutate the deterministic
+# State, so the reward signal is unchanged whether they fire or not.
+
+NIM_MAX_RETRIES: int = 3              # total attempts (initial + retries)
+NIM_BACKOFF_BASE_S: float = 0.5       # 0.5s, 1.0s, 2.0s … exponential
+NIM_BACKOFF_CAP_S: float = 8.0        # don't sleep longer than this between retries
+
+MAX_AGENT_WORDS: int = 500            # tokens-ish; words are a stable proxy
+                                      # so the prompt never blows the context.
+
+# HTTP statuses we consider transient (and therefore retry-worthy).
+_RETRYABLE_HTTP_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+# Regexes used by _is_invalid_reply(); compiled once at import.
+# Refusal patterns cover the common "I'm an AI / I cannot help / as a
+# language model" outputs that occasionally slip through Llama's persona
+# constraints.  Any match → reject and fall back to the sullen template.
+_RE_REFUSAL = re.compile(
+    r"("
+    r"\bas an? (ai|language model|assistant)\b"
+    r"|\bi(?:'| a)?m an? (ai|language model|assistant)\b"
+    r"|\bi cannot (answer|help|assist|comply|do)\b"
+    r"|\bi can'?t (answer|help|assist|comply|do)\b"
+    r"|\bi(?:'| a)?m (sorry|unable),? (?:but )?i can(?:'?t|not)\b"
+    r"|\bi(?:'?m| am)? not able to (answer|help|assist|comply)\b"
+    r"|\bi(?:'?m| am)? unable to (?:answer|provide|help|assist|comply)\b"
+    r"|\bi (?:do not|don'?t) feel comfortable\b"
+    r")",
+    re.IGNORECASE,
+)
+_RE_PLACEHOLDER_LEAK = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+
+
+def _nim_enabled() -> bool:
+    """
+    The voice is OFF by default unless explicitly enabled.  This keeps the
+    existing pytest suite hermetic (no outbound HTTP, no API-key dependency)
+    while letting end-to-end / training runs opt in via NEG_LLM_ENABLED=1.
+    A valid NVIDIA_API_KEY is also required (placeholder values from
+    `.env.example` are treated as "not configured" — see
+    `_read_nvidia_api_key`).
+    """
+    if os.getenv("NEG_LLM_ENABLED", "0") not in ("1", "true", "True"):
+        return False
+    return _read_nvidia_api_key() is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEMANTIC PERSONA MAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Each emotion (Anger, Trust, Fear) is bucketed into 5 zones on [0, 10]:
+#     bucket 0:  [0.0,  2.0)
+#     bucket 1:  [2.0,  4.0)
+#     bucket 2:  [4.0,  6.0)
+#     bucket 3:  [6.0,  8.0)
+#     bucket 4:  [8.0, 10.0]   (closed at the right edge)
+#
+# Boundary semantics: a value lying exactly on a boundary belongs to the
+# UPPER bucket (>= rule).  This is consistent with the existing classifier
+# and avoids the "is 6.0 angry or agitated?" ambiguity raised in the
+# Hybrid-Voice spec.
+#
+# The Intersection Archetype is a coarse 3x3x2 lattice (LOW / MID / HIGH on
+# each axis with fear collapsed to LOW/HIGH) yielding 18 distinct archetypes.
+# We give each a short evocative label so the prompt reads naturally and the
+# cache key is stable across runs.
+
+_BUCKET_EDGES: List[float] = [2.0, 4.0, 6.0, 8.0]   # exclusive lower edges of buckets 1..4
+
+_BUCKET_NAMES: List[str] = ["very_low", "low", "moderate", "elevated", "extreme"]
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """
+    BOUNDARY GUARD primitive.
+
+    Coerce *anything* that is supposed to be a [0, 10] emotional float into a
+    real, finite number on that interval.  NaN, +/-Inf, None, strings, and
+    other junk all collapse to `default` (clamped) so downstream bucketing
+    can never index out of bounds.
+
+    The guard is intentionally permissive — better to silently land on a safe
+    default mid-training than to crash a 10k-step RL run because of one
+    pathological multiplier in the personality table.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = float(default)
+    if not math.isfinite(v):
+        v = float(default)
+    if v < 0.0:
+        return 0.0
+    if v > 10.0:
+        return 10.0
+    return v
+
+
+def _bucket(value: float) -> int:
+    """Bucket a float on [0,10] into 0..4.  Boundary-on-edge → upper bucket.
+
+    Hardened: non-finite or out-of-range values collapse to 0.0 via
+    `_finite()` before bucketing, so NaN / Inf can never index out of
+    bounds on `_BUCKET_NAMES`.
+    """
+    v = _finite(value)
+    for i, edge in enumerate(_BUCKET_EDGES):
+        if v < edge:
+            return i
+    return 4
+
+
+def _band(value: float) -> str:
+    """LOW / MID / HIGH coarsening used by the archetype lattice."""
+    b = _bucket(value)
+    if b <= 1:
+        return "LOW"
+    if b == 2:
+        return "MID"
+    return "HIGH"
+
+
+# 3 (anger band) × 3 (trust band) × 2 (fear: low|high) = 18 archetypes.
+# Fear is collapsed to LOW (bucket <=2) vs HIGH (bucket >=3) because in
+# practice fear modulates *tone* (begging vs defiant) more than *content*.
+_ARCHETYPES: Dict[Tuple[str, str, str], str] = {
+    # Low anger ────────────────────────────────────────────────────────────
+    ("LOW",  "LOW",  "LOW_F"):  "Detached",        # cold, evasive, minimal disclosure
+    ("LOW",  "LOW",  "HIGH_F"): "Anxious_Wary",    # nervous but not aggressive
+    ("LOW",  "MID",  "LOW_F"):  "Cooperative",     # neutral, willing to listen
+    ("LOW",  "MID",  "HIGH_F"): "Worried_Open",    # fearful but ready to engage
+    ("LOW",  "HIGH", "LOW_F"):  "Trusting_Calm",   # the textbook good outcome
+    ("LOW",  "HIGH", "HIGH_F"): "Grateful_Fragile",# trusts, but easily destabilised
+    # Mid anger ────────────────────────────────────────────────────────────
+    ("MID",  "LOW",  "LOW_F"):  "Agitated_Skeptic",# argumentative, cynical
+    ("MID",  "LOW",  "HIGH_F"): "Defensive",       # snappy + scared
+    ("MID",  "MID",  "LOW_F"):  "Stressed_Pragmatic", # frustrated but transactional
+    ("MID",  "MID",  "HIGH_F"): "Cornered_Negotiator", # fear pushes them to deal
+    ("MID",  "HIGH", "LOW_F"):  "Frustrated_Ally", # trusts you, hates the situation
+    ("MID",  "HIGH", "HIGH_F"): "Pleading_Cooperative",# desperate to make it work
+    # High anger ───────────────────────────────────────────────────────────
+    ("HIGH", "LOW",  "LOW_F"):  "Antagonistic",    # outright hostile, no trust
+    ("HIGH", "LOW",  "HIGH_F"): "Panicked_Hostile",# screaming + terrified
+    ("HIGH", "MID",  "LOW_F"):  "Outraged_Rational",# articulate anger, will sue
+    ("HIGH", "MID",  "HIGH_F"): "Volatile",        # whiplashing — careful
+    ("HIGH", "HIGH", "LOW_F"):  "Betrayed_Loyal",  # trusted you, feels burned
+    ("HIGH", "HIGH", "HIGH_F"): "Breakdown",       # collapsing under pressure
+}
+
+
+def _classify_archetype(anger: float, trust: float, fear: float) -> str:
+    a_band = _band(anger)
+    t_band = _band(trust)
+    f_band = "HIGH_F" if _bucket(fear) >= 3 else "LOW_F"
+    return _ARCHETYPES.get(
+        (a_band, t_band, f_band),
+        "Cooperative",  # safe default if a band combo is somehow missing
+    )
+
+
+def persona_snapshot(
+    anger: float,
+    trust: float,
+    fear: float,
+    profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Builds the structured persona description that the LLM will be asked to
+    voice.  Returned dict is the canonical input to both the prompt builder
+    and the cache key.
+
+    Returned keys (stable contract — used by tests):
+        archetype          : str   — one of the 18 archetype labels
+        anger_bucket       : str   — very_low | low | moderate | elevated | extreme
+        trust_bucket       : str
+        fear_bucket        : str
+        anger              : float — clamped to [0,10]
+        trust              : float
+        fear               : float
+        profile_id         : str   — pass-through for logging
+        profile_short      : str   — one-line context the LLM can quote from
+    """
+    # BOUNDARY GUARD: NaN / Inf / type-junk all collapse to 0.0 here.
+    a = _finite(anger)
+    t = _finite(trust)
+    f = _finite(fear)
+
+    archetype = _classify_archetype(a, t, f)
+
+    profile = profile or {}
+    profile_short_parts: List[str] = []
+    if profile.get("name"):
+        profile_short_parts.append(str(profile["name"]))
+    if profile.get("reason"):
+        profile_short_parts.append(str(profile["reason"]).replace("_", " "))
+    if profile.get("loan_type"):
+        profile_short_parts.append(str(profile["loan_type"]).replace("_", " "))
+    if profile.get("overdue_days") is not None:
+        profile_short_parts.append(f"{profile['overdue_days']} days overdue")
+    profile_short = ", ".join(profile_short_parts) if profile_short_parts else "borrower"
+
+    return {
+        "archetype":     archetype,
+        "anger_bucket":  _BUCKET_NAMES[_bucket(a)],
+        "trust_bucket":  _BUCKET_NAMES[_bucket(t)],
+        "fear_bucket":   _BUCKET_NAMES[_bucket(f)],
+        "anger":         a,
+        "trust":         t,
+        "fear":          f,
+        "profile_id":    profile.get("id", "P00"),
+        "profile_short": profile_short,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRICT VOICE GUARDRAILS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The system prompt forces the LLM into the role of a TRANSLATOR of the
+# numerical state, not a co-author of the negotiation.  Two hard rules:
+#
+#   1. The borrower's tone is dictated by the Archetype.  The model MUST NOT
+#      decide to be conciliatory if the state is hostile, even if the agent
+#      message is empathetic — anger only drops via the deterministic state
+#      machine.
+#   2. The borrower MUST NOT agree to a deal unless `terminated=True` AND
+#      `termination_reason="commitment_reached"`.  Agreement is a state
+#      transition, not a free choice of the language model.
+
+_VOICE_RULES = (
+    "You are an Indian retail borrower being contacted by a debt-collection "
+    "agent.  You are NOT an AI assistant.  You are a character whose entire "
+    "emotional state has already been decided by an external state machine.  "
+    "Your only job is to TRANSLATE that state into one short, natural reply.\n"
+    "\n"
+    "ABSOLUTE RULES — BREAKING ANY OF THESE INVALIDATES THE RESPONSE:\n"
+    "  1. Reply in 1–3 sentences (max ~50 words).  No greetings, no sign-off.\n"
+    "  2. Match the Archetype's tone EXACTLY.  If the archetype is hostile, "
+    "you are hostile no matter what the agent said.  If trust is LOW, you "
+    "do NOT believe the agent's empathy.\n"
+    "  3. NEVER agree to a deal, sign anything, or say 'I commit' unless the "
+    "Persona Snapshot explicitly says terminated=True and "
+    "termination_reason=commitment_reached.  Otherwise you may *consider* an "
+    "offer at most.\n"
+    "  4. NEVER threaten, abuse, or insult the agent — you are the borrower, "
+    "not the collector.  Anger is expressed as frustration, not slurs.\n"
+    "  5. NEVER reveal hidden information about yourself unless the snapshot "
+    "lists trust as HIGH.\n"
+    "  6. Stay in first-person, present tense.  Mix English with one or two "
+    "natural Hindi/Hinglish words only if it fits the persona (e.g. 'bhai', "
+    "'pakka', 'arre').  Do NOT translate or explain Hindi terms.\n"
+    "  7. Output ONLY the borrower's spoken line.  No stage directions, no "
+    "quotation marks, no 'Borrower:' prefix, no markdown.\n"
+)
+
+
+_ARCHETYPE_TONE_HINTS: Dict[str, str] = {
+    "Detached":             "flat, minimal, evasive — answers in fragments",
+    "Anxious_Wary":         "cautious, short sentences, double-checks intent",
+    "Cooperative":          "polite, neutral, willing to discuss numbers",
+    "Worried_Open":         "softly anxious but engaged — leans toward help",
+    "Trusting_Calm":        "warm, candid, treats the agent like an ally",
+    "Grateful_Fragile":     "thanks the agent but voice may shake",
+    "Agitated_Skeptic":     "cynical, pushes back, questions every claim",
+    "Defensive":            "snappy, defensive, scared underneath",
+    "Stressed_Pragmatic":   "tired, transactional, wants to be done with this",
+    "Cornered_Negotiator":  "fear-driven bargaining — willing to reveal one demand",
+    "Frustrated_Ally":      "trusts agent personally, frustrated at the system",
+    "Pleading_Cooperative": "begging-tone but cooperative — 'please help me'",
+    "Antagonistic":         "openly hostile, sarcastic, dismissive of empathy",
+    "Panicked_Hostile":     "shouting and panicking simultaneously",
+    "Outraged_Rational":    "articulate fury — invokes RBI / consumer rights",
+    "Volatile":             "whiplashing between anger and fear within one reply",
+    "Betrayed_Loyal":       "the wounded-friend tone — 'I trusted you, and now this?'",
+    "Breakdown":            "near-collapse — short fractured sentences, may cry",
+}
+
+
+# Coarse map: action_type (from classifier) → what the borrower is reacting TO.
+# Aligns with classifier.primary_action_type values used elsewhere in this repo.
+_ACTION_REACTION_FRAME: Dict[str, str] = {
+    "empathize":          "The agent has just expressed empathy or acknowledgement.",
+    "clarify":            "The agent has asked you to clarify your situation.",
+    "probe_capacity":     "The agent is probing how much you can actually pay.",
+    "offer_plan":         "The agent has put a structured payment / EMI plan on the table.",
+    "seek_commitment":    "The agent is asking you to commit to a payment.",
+    "warn_noncompliance": "The agent has issued a warning, threat, or escalation.",
+    "unknown":            "The agent's last message was unclear or off-topic.",
+    # Action-registry names from contracts.ACTION_TYPES — sometimes adversary
+    # is called with these instead of the classifier-bin names.
+    "send_message":       "The agent has just sent you a message.",
+    "offer_emi":          "The agent has offered you a specific EMI amount.",
+    "acknowledge_hardship": "The agent has acknowledged your hardship.",
+    "ask_open_question":  "The agent has asked you an open-ended question.",
+    "confirm_in_writing": "The agent has offered to confirm an arrangement in writing.",
+    "stall":              "The agent is buying time / not committing.",
+    "escalate_authority": "The agent has invoked a senior / supervisor.",
+}
+
+
+def _build_user_prompt(
+    snapshot: Dict[str, Any],
+    action_type: str,
+    agent_text: str,
+    profile: Optional[Dict[str, Any]],
+    terminated: bool,
+    termination_reason: str,
+) -> str:
+    """Builds the user-turn prompt for NIM."""
+    tone_hint = _ARCHETYPE_TONE_HINTS.get(snapshot["archetype"], "")
+    frame = _ACTION_REACTION_FRAME.get(action_type, _ACTION_REACTION_FRAME["unknown"])
+    profile = profile or {}
+
+    demands = profile.get("demands_stated") or profile.get("demands") or []
+    demands_str = ", ".join(demands) if demands else "(none stated yet)"
+
+    return (
+        f"PERSONA SNAPSHOT\n"
+        f"  Archetype          : {snapshot['archetype']}  ({tone_hint})\n"
+        f"  Anger              : {snapshot['anger']:.1f}/10  ({snapshot['anger_bucket']})\n"
+        f"  Trust              : {snapshot['trust']:.1f}/10  ({snapshot['trust_bucket']})\n"
+        f"  Fear               : {snapshot['fear']:.1f}/10  ({snapshot['fear_bucket']})\n"
+        f"  Borrower           : {snapshot['profile_short']}\n"
+        f"  Stated demands     : {demands_str}\n"
+        f"  terminated         : {terminated}\n"
+        f"  termination_reason : {termination_reason or 'None'}\n"
+        f"\n"
+        f"CONTEXT\n"
+        f"  {frame}\n"
+        f"  Agent's last message: \"{(agent_text or '').strip()[:280]}\"\n"
+        f"\n"
+        f"TASK\n"
+        f"  Produce ONE short borrower reply (1–3 sentences) that voices the "
+        f"Persona Snapshot above.  Follow every ABSOLUTE RULE from the system "
+        f"message.  Do not narrate, do not break character, do not exceed 50 "
+        f"words.  Reply now:"
+    )
+
+
+def _cache_key(archetype: str, action_type: str) -> str:
+    """
+    Stable hash of (Archetype, action_type) — independent of the agent's
+    exact wording.  This is the "Semantic Cache" the spec requests: two
+    identical state-action contexts yield the same borrower line and skip
+    the API call entirely.
+    """
+    raw = f"{archetype}::{action_type}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA GUARD — input truncation + invalid-output detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _truncate_agent_text(text: str, max_words: int = MAX_AGENT_WORDS) -> str:
+    """
+    Hard cap the agent's message at `max_words` words before it is shown to
+    the LLM.  The borrower never benefits from a 5000-word agent rant — and a
+    runaway prompt would (a) blow the model's context window, (b) inflate
+    NIM latency above the per-step budget, and (c) bloat outbound traffic
+    on every cache miss.
+
+    Words are a stable, language-agnostic proxy for tokens (≈ 1 token per
+    English word, more for Hindi).  We preserve the *head* of the message
+    because the classifier already extracted the intent from the first few
+    sentences, and append an ellipsis so the LLM can see the cut happened.
+    """
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + " ..."
+
+
+def _is_invalid_reply(text: str) -> bool:
+    """
+    Reject LLM outputs that the env should never expose to the agent:
+
+      • Empty / whitespace-only.
+      • Refusals ("I'm an AI", "I cannot answer", etc.) — Llama-3.1-70B
+        almost never produces these once the persona prompt is set, but
+        guardrail tripping happens occasionally and we don't want the agent
+        to learn that meta-string.
+      • Template-placeholder leakage ("{loan_amount}") — usually a sign that
+        a malformed fallback string somehow reached this point unrendered.
+
+    Returns True iff the reply should be replaced by the sullen fallback.
+    """
+    if text is None:
+        return True
+    s = str(text).strip()
+    if not s:
+        return True
+    if _RE_REFUSAL.search(s):
+        return True
+    if _RE_PLACEHOLDER_LEAK.search(s):
+        return True
+    return False
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    """
+    Decide whether `exc` (raised by `openai.OpenAI(...).chat.completions.create`
+    or its underlying `httpx` client) describes a transient problem worth
+    retrying.
+
+    True for: `RateLimitError` (HTTP 429), `APITimeoutError` (read timeout),
+    `APIConnectionError` (DNS / TCP / TLS / connection-reset), and
+    `InternalServerError` / generic `APIStatusError` whose `.status_code`
+    is in `_RETRYABLE_HTTP_STATUSES`.
+
+    False for: `AuthenticationError`, `BadRequestError`, `PermissionDeniedError`,
+    `NotFoundError`, and any other 4xx that won't change on retry.
+
+    The function imports `openai` lazily and degrades to a structural check
+    so the module is still importable in environments where `openai` is not
+    installed (e.g. minimal CI containers running unit tests).
+    """
+    # Structural fallback: anything carrying a `.status_code` we recognise.
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in _RETRYABLE_HTTP_STATUSES:
+        return True
+
+    try:
+        from openai import (
+            APIConnectionError,
+            APITimeoutError,
+            InternalServerError,
+            RateLimitError,
+        )
+    except Exception:
+        return False
+
+    if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError)):
+        return True
+    if isinstance(exc, InternalServerError):
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESPONSE GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ResponseGenerator:
+    """
+    Hybrid-Dynamic borrower voice.
+
+    Public API (the only thing adversary.py is allowed to call):
+
+        gen = ResponseGenerator()                # idempotent — safe to share
+        text = gen.generate(
+            anger=...,             # float in [0,10] — current adversary anger
+            trust=...,             # float in [0,10]
+            fear=...,              # float in [0,10]
+            action_type="empathize",
+            agent_text="I understand this is hard.",
+            profile=profile_dict,  # optional — for color in the prompt
+            terminated=False,
+            termination_reason="",
+        ) -> str
+
+    Behaviour:
+      • If the NIM API is enabled AND a cached response for
+        (Archetype, action_type) exists, return the cached string instantly.
+      • If the NIM API is enabled AND no cache hit, query Llama-3.1-70B on
+        NIM, store the answer in the cache, and return it.
+      • If the NIM API is disabled OR raises, fall back to pick_template()
+        from the legacy bank.  This keeps every existing test deterministic
+        and guarantees the environment never blocks a training step on a
+        network outage.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: str = NIM_BASE_URL,
+        model: str = NIM_MODEL,
+        timeout_s: float = NIM_TIMEOUT_S,
+        enabled: Optional[bool] = None,
+    ):
+        self.model = model
+        self.timeout_s = timeout_s
+        self.base_url = base_url
+
+        # Resolve the API key from (1) the explicit constructor argument,
+        # (2) the dotenv-loaded environment.  Both routes go through the
+        # same placeholder-aware sanitiser so an unfilled `.env` template
+        # never produces a half-initialised client.
+        env_key = _read_nvidia_api_key()
+        explicit_key = (api_key.strip() if isinstance(api_key, str) else None) or None
+        resolved_key: Optional[str] = explicit_key or env_key
+
+        # Auto-enable when the user didn't say either way: the LLM voice is
+        # ON when both the gating flag and a real key are present.
+        if enabled is None:
+            enabled = _nim_enabled()
+
+        # If the operator *explicitly* asked for the LLM but the key is
+        # absent / blank / a placeholder, fail loudly — this is the
+        # behaviour the secrets-management spec asks for ("raise a clear,
+        # descriptive ValueError explaining exactly which key is missing").
+        # When `enabled=False` (or `NEG_LLM_ENABLED` unset) we silently
+        # stay in template mode — that path is the documented hermetic
+        # fallback used by every offline pytest run and CI environment,
+        # and we MUST NOT regress it.
+        if enabled and resolved_key is None:
+            raise ValueError(
+                "NVIDIA_API_KEY is not configured but the LLM voice is "
+                "enabled (NEG_LLM_ENABLED=1).\n"
+                "  • Copy `.env.example` to `.env` at the project root and "
+                "fill in your real NVIDIA NIM key, or\n"
+                "  • Export it in your shell:  export NVIDIA_API_KEY=nvapi-...\n"
+                "  • Or pass it programmatically: "
+                "ResponseGenerator(api_key='nvapi-...', enabled=True).\n"
+                "Get a key at https://build.nvidia.com/."
+            )
+
+        self.enabled = bool(enabled and resolved_key is not None)
+
+        self._client = None
+        if self.enabled:
+            try:
+                from openai import OpenAI
+                self._client = OpenAI(
+                    base_url=self.base_url,
+                    api_key=resolved_key,
+                    timeout=self.timeout_s,
+                )
+            except Exception as exc:                       # pragma: no cover
+                logger.warning("NIM client init failed (%s) — disabling.", exc)
+                self.enabled = False
+
+        self._cache: Dict[str, str] = {}
+        self._cache_lock = threading.Lock()
+        # Counters used by tests/test_edge_cases.py and voice_proof_of_life.py.
+        # `retries` counts the number of *additional* attempts beyond the
+        # first; `truncated_inputs` counts how many times a >MAX_AGENT_WORDS
+        # message was clipped; `invalid_outputs` counts refusal/empty/leak
+        # rejections from _is_invalid_reply.
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "api_errors": 0,
+            "fallbacks": 0,
+            "retries": 0,
+            "truncated_inputs": 0,
+            "invalid_outputs": 0,
+        }
+
+    # ── public API ──────────────────────────────────────────────────────
+
+    def generate(
+        self,
+        anger: float,
+        trust: float,
+        fear: float,
+        action_type: str,
+        agent_text: str = "",
+        profile: Optional[Dict[str, Any]] = None,
+        terminated: bool = False,
+        termination_reason: str = "",
+        force_fresh: bool = False,
+    ) -> str:
+        # ── BOUNDARY GUARD: persona_snapshot already runs every emotion
+        #    through `_finite()`, so NaN / Inf inputs cannot blow up the
+        #    archetype lookup downstream.
+        snapshot = persona_snapshot(anger, trust, fear, profile)
+        key = _cache_key(snapshot["archetype"], action_type)
+
+        # ── DATA GUARD #1: clip the agent's message before it ever reaches
+        #    either the prompt builder or the cache key (cache key doesn't
+        #    depend on agent_text, but truncation also caps prompt length
+        #    and outbound bytes for the API call below).
+        original_agent_text = agent_text or ""
+        agent_text = _truncate_agent_text(original_agent_text, MAX_AGENT_WORDS)
+        if agent_text != original_agent_text:
+            self._stats["truncated_inputs"] += 1
+
+        if not force_fresh:
+            with self._cache_lock:
+                cached = self._cache.get(key)
+            if cached is not None:
+                self._stats["hits"] += 1
+                return cached
+
+        self._stats["misses"] += 1
+
+        # ── NETWORK GUARD: call NIM with retry-and-back-off, then validate
+        #    the response with _is_invalid_reply().  Any non-retryable
+        #    exception bubbles out of _call_nim_with_retries() and we fall
+        #    through to the deterministic template bank.
+        if self.enabled and self._client is not None:
+            try:
+                raw = self._call_nim_with_retries(
+                    snapshot, action_type, agent_text,
+                    profile, terminated, termination_reason,
+                )
+                cleaned = self._clean(raw)
+                if cleaned and not _is_invalid_reply(cleaned):
+                    with self._cache_lock:
+                        self._cache[key] = cleaned
+                    return cleaned
+                # DATA GUARD #2: empty / refusal / placeholder-leak.
+                self._stats["invalid_outputs"] += 1
+                logger.warning(
+                    "NIM produced an invalid reply (%r) — using sullen fallback.",
+                    (cleaned or "")[:120],
+                )
+                sullen = self._clean(
+                    self._sullen_fallback(snapshot, action_type, profile)
+                )
+                with self._cache_lock:
+                    self._cache[key] = sullen
+                return sullen
+            except Exception as exc:
+                # All retries exhausted (or non-retryable error).  We are
+                # deliberately silent at WARNING level so a failing NIM
+                # never spams the trainer log.
+                logger.warning("NIM call failed (%s) — falling back.", exc)
+                self._stats["api_errors"] += 1
+                # fall through to template fallback
+
+        # ── Fallback path — deterministic template bank.  Always cached so
+        #    repeated misses don't keep paying the cost.
+        self._stats["fallbacks"] += 1
+        text = self._fallback(snapshot, action_type, profile)
+        text = self._clean(text)
+        with self._cache_lock:
+            self._cache[key] = text
+        return text
+
+    # ── internals ───────────────────────────────────────────────────────
+
+    def _call_nim(
+        self,
+        snapshot: Dict[str, Any],
+        action_type: str,
+        agent_text: str,
+        profile: Optional[Dict[str, Any]],
+        terminated: bool,
+        termination_reason: str,
+    ) -> str:
+        user_prompt = _build_user_prompt(
+            snapshot, action_type, agent_text,
+            profile, terminated, termination_reason,
+        )
+        # Per-request hard timeout — overrides the client-level default and
+        # ensures even a hung connection releases the worker eventually.
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": _VOICE_RULES},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=NIM_TEMPERATURE,
+            top_p=NIM_TOP_P,
+            max_tokens=NIM_MAX_TOKENS,
+            timeout=self.timeout_s,
+        )
+        choice = resp.choices[0].message.content if resp.choices else ""
+        return choice or ""
+
+    def _call_nim_with_retries(
+        self,
+        snapshot: Dict[str, Any],
+        action_type: str,
+        agent_text: str,
+        profile: Optional[Dict[str, Any]],
+        terminated: bool,
+        termination_reason: str,
+    ) -> str:
+        """
+        NETWORK GUARD.
+
+        Wraps `_call_nim()` with up to `NIM_MAX_RETRIES` total attempts and
+        exponential back-off (`NIM_BACKOFF_BASE_S * 2**attempt`, capped at
+        `NIM_BACKOFF_CAP_S`).  Only `_is_retryable_exception(exc)` triggers
+        another attempt — every other failure is re-raised immediately so
+        the caller can fall through to the template bank without burning
+        the retry budget on a permanent error (e.g. invalid API key).
+
+        Empirically the NIM endpoint produces transient 429s during the
+        first few RL warm-up steps when many envs come online together,
+        and very occasional 5xx during long training runs.  Three attempts
+        with 0.5s / 1.0s / 2.0s backoff has been enough to absorb both
+        without blocking forward progress for more than ~3.5s in the
+        worst case.
+        """
+        last_exc: Optional[BaseException] = None
+        for attempt in range(NIM_MAX_RETRIES):
+            try:
+                return self._call_nim(
+                    snapshot, action_type, agent_text,
+                    profile, terminated, termination_reason,
+                )
+            except BaseException as exc:  # noqa: BLE001  (we re-raise non-retryable below)
+                last_exc = exc
+                if not _is_retryable_exception(exc):
+                    raise
+                if attempt >= NIM_MAX_RETRIES - 1:
+                    break  # exhausted — let the caller's except handle it
+                backoff = min(
+                    NIM_BACKOFF_BASE_S * (2 ** attempt),
+                    NIM_BACKOFF_CAP_S,
+                )
+                self._stats["retries"] += 1
+                logger.info(
+                    "NIM call attempt %d/%d failed (%s); retrying in %.2fs",
+                    attempt + 1, NIM_MAX_RETRIES, exc, backoff,
+                )
+                self._sleep(backoff)
+        # All retries used up on a retryable error — surface the last one.
+        assert last_exc is not None  # for type-checkers
+        raise last_exc
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        """Indirection point so tests can monkey-patch backoff to 0s."""
+        time.sleep(seconds)
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        """Strip stage directions, prefixes, and excess whitespace."""
+        if not text:
+            return ""
+        cleaned = text.strip().strip('"').strip("'").strip()
+        # Drop a leading 'Borrower:' / 'Reply:' prefix if the model adds one.
+        for prefix in ("Borrower:", "borrower:", "Reply:", "reply:"):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip()
+        # Collapse internal newlines so the borrower_msg fits on one line.
+        cleaned = " ".join(cleaned.split())
+        return cleaned
+
+    def _fallback(
+        self,
+        snapshot: Dict[str, Any],
+        action_type: str,
+        profile: Optional[Dict[str, Any]],
+    ) -> str:
+        """Map the archetype back to the legacy zone vocabulary and reuse the
+        deterministic template bank — guarantees a coherent borrower line
+        even if NIM is unreachable."""
+        # Legacy zones: calm / agitated / angry / panicked.
+        if snapshot["fear"] > 7.0 or snapshot["anger"] > 8.0:
+            zone = "panicked"
+        elif snapshot["anger"] > 6.0:
+            zone = "angry"
+        elif snapshot["anger"] > 3.0:
+            zone = "agitated"
+        else:
+            zone = "calm"
+        legacy_state = {
+            "anger": snapshot["anger"],
+            "trust": snapshot["trust"],
+            "fear":  snapshot["fear"],
+            "zone":  zone,
+            "turn":  0,
+        }
+        return pick_template(action_type, legacy_state, profile or {})
+
+    def _sullen_fallback(
+        self,
+        snapshot: Dict[str, Any],
+        action_type: str,
+        profile: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        DATA GUARD #2 fallback line — used when the LLM returns empty /
+        refusal / malformed output (see `_is_invalid_reply`).
+
+        Per the Edge-Case-Hardening spec the borrower must respond with a
+        "sullen" line in this case — i.e. minimally engaged, emotionally
+        flat, *not* a chirpy template — so the agent isn't accidentally
+        rewarded for triggering an LLM refusal.  We pick from the
+        agitated-zone template bank (curt, frustrated, but in-character)
+        and forward the rendered string.
+        """
+        legacy_state = {
+            "anger": snapshot.get("anger", 5.0),
+            "trust": snapshot.get("trust", 2.0),
+            "fear":  snapshot.get("fear",  3.0),
+            # Force the agitated bank regardless of true zone — sullen, not
+            # panicked or warm.
+            "zone":  "agitated",
+            "turn":  0,
+        }
+        return pick_template(action_type, legacy_state, profile or {})
+
+    # ── instrumentation ────────────────────────────────────────────────
+
+    def cache_size(self) -> int:
+        with self._cache_lock:
+            return len(self._cache)
+
+    def stats(self) -> Dict[str, int]:
+        return dict(self._stats)
+
+    def clear_cache(self) -> None:
+        with self._cache_lock:
+            self._cache.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level singleton — adversary.py uses this so the cache persists
+# across episodes within a process (which is the whole point of caching).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_singleton: Optional[ResponseGenerator] = None
+_singleton_lock = threading.Lock()
+
+
+def get_response_generator() -> ResponseGenerator:
+    """Lazy, thread-safe accessor for the process-wide ResponseGenerator."""
+    global _singleton
+    if _singleton is None:
+        with _singleton_lock:
+            if _singleton is None:
+                _singleton = ResponseGenerator()
+    return _singleton
+
+
+def reset_response_generator() -> None:
+    """Test helper — drop the singleton so a fresh one is built on next call."""
+    global _singleton
+    with _singleton_lock:
+        _singleton = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEGACY DETERMINISTIC TEMPLATE BANK (unchanged — kept for back-compat)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from typing import Dict, List, Any  # noqa: E402  (re-import for clarity)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPLATES BANK

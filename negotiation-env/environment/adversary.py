@@ -1,12 +1,57 @@
 # environment/adversary.py
+import math
 from typing import Tuple, Dict, Any, List, Optional
 from .classifier import classify_action
-from .response_generator import pick_template
+# pick_template is kept importable for legacy callers and tests; the live
+# voice path goes through the ResponseGenerator singleton instead.
+from .response_generator import (
+    pick_template,                   # noqa: F401  (re-export / fallback)
+    get_response_generator,
+)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """
+    BOUNDARY GUARD primitive used inside _update_state().
+
+    Coerce `value` to a finite float.  NaN, +/-Inf, None, and unparseable
+    types all collapse to `default`.  A pathological multiplier (say a
+    rogue `float('inf')` slipping into a personality table) cannot
+    produce a non-finite anger / trust / fear value once this filter is
+    applied to every read and write inside the state machine.
+
+    NB: this DOES NOT clamp to [0, 10].  Range clamping happens after the
+    delta is added so we don't lose the sign of the update.  Only finiteness
+    is enforced here.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(v):
+        return float(default)
+    return v
+
+
+def _clamp_emotion(value: Any, prev: float = 0.0) -> float:
+    """
+    Force `value` to a finite float in [0.0, 10.0].  If `value` is non-finite
+    we fall back to the previous (already-finite) value for that emotion so
+    a single bad delta doesn't reset the whole episode's mood.
+    """
+    v = _safe_float(value, default=prev)
+    if v < 0.0:
+        return 0.0
+    if v > 10.0:
+        return 10.0
+    return v
 
 """
 HOLDS: BorrowerAdversary class.
 RUNS: called every step inside env.py.
-CONNECTS TO: classifier.py, response_generator.py, env.py.
+CONNECTS TO: classifier.py, response_generator.py (ResponseGenerator
+             singleton — Hybrid-Dynamic voice over NVIDIA NIM /
+             Llama-3.1-70B), env.py.
 """
 
 PERSONALITY_MODIFIERS = {
@@ -130,6 +175,13 @@ class BorrowerAdversary:
         self.terminated = False
         self.termination_reason = ""
 
+        # Cache of the last agent message — passed to ResponseGenerator so
+        # the LLM can ground its reply in what the agent actually said.
+        # Reward computation does NOT read this; it stays a pure adversary
+        # internal so the deterministic state machine remains the only
+        # source of truth for state transitions.
+        self._last_agent_text: str = ""
+
     def opening_turn(self) -> str:
         """Returns the initial message from the borrower."""
         return self.profile["opening_msg"]
@@ -140,6 +192,9 @@ class BorrowerAdversary:
         """
         if self.terminated:
             return "Episode already ended.", True, self.termination_reason
+
+        # Remember the agent's text so the dynamic voice can quote/ground in it.
+        self._last_agent_text = llm_action_text or ""
 
         # 1. Get signals if not provided
         if signals is None:
@@ -162,32 +217,44 @@ class BorrowerAdversary:
         return response_text, self.terminated, self.termination_reason
 
     def _update_state(self, signals: Dict[str, Any]):
-        """Applies signal deltas with personality modifiers."""
-        
-        # Base deltas from classifier
-        a_delta = signals["anger_delta"]
-        t_delta = signals["trust_delta"]
-        f_delta = signals["fear_delta"]
+        """Applies signal deltas with personality modifiers.
 
-        # Apply personality scaling
+        BOUNDARY GUARD: every delta and every running multiplier is run
+        through `_safe_float()` so a NaN / Inf can't leak into the state.
+        After all the arithmetic, `_clamp_emotion()` enforces the [0, 10]
+        range and finiteness — so even if a personality entry contained a
+        bad value, the episode would silently continue with a sane mood.
+        """
+        # Base deltas from classifier — sanitised at the boundary.
+        a_delta = _safe_float(signals.get("anger_delta", 0.0))
+        t_delta = _safe_float(signals.get("trust_delta", 0.0))
+        f_delta = _safe_float(signals.get("fear_delta", 0.0))
+
+        # Apply personality scaling (each modifier is also sanitised so a
+        # rogue Inf in PERSONALITY_MODIFIERS can't propagate).
         if a_delta < 0: # De-escalation (empathy/ack)
-            a_delta *= self.mods.get("empathy_anger_scale", 1.0)
+            a_delta *= _safe_float(self.mods.get("empathy_anger_scale", 1.0), 1.0)
         else: # Escalation (threat/pressure)
-            a_delta *= self.mods.get("threat_anger_scale", 1.0)
+            a_delta *= _safe_float(self.mods.get("threat_anger_scale", 1.0), 1.0)
 
         if t_delta > 0:
             if signals["meta"]["has_empathy"]:
-                t_delta *= self.mods.get("empathy_trust_scale", 1.0)
+                t_delta *= _safe_float(self.mods.get("empathy_trust_scale", 1.0), 1.0)
             if signals["extracted_offer"]["amount"] or signals["extracted_offer"]["emi"]:
-                t_delta *= self.mods.get("payment_offer_trust_scale", 1.0)
+                t_delta *= _safe_float(self.mods.get("payment_offer_trust_scale", 1.0), 1.0)
             if signals["meta"]["has_open_question"]:
-                t_delta *= self.mods.get("probe_trust_scale", 1.0)
+                t_delta *= _safe_float(self.mods.get("probe_trust_scale", 1.0), 1.0)
         else:
-            t_delta *= self.mods.get("threat_trust_scale", 1.0)
+            t_delta *= _safe_float(self.mods.get("threat_trust_scale", 1.0), 1.0)
 
         if f_delta > 0:
             if "physical_visit" in signals["risk_flags"]:
-                f_delta *= self.mods.get("home_visit_fear_scale", 1.0)
+                f_delta *= _safe_float(self.mods.get("home_visit_fear_scale", 1.0), 1.0)
+
+        # Re-sanitise after the multipliers in case a 0 × Inf produced NaN.
+        a_delta = _safe_float(a_delta)
+        t_delta = _safe_float(t_delta)
+        f_delta = _safe_float(f_delta)
 
         # Context-aware adjustments
         if signals["primary_action_type"] == "warn_noncompliance" and signals["compliance_flags"]:
@@ -196,10 +263,12 @@ class BorrowerAdversary:
         if signals["primary_action_type"] == "offer_plan" and (signals["extracted_offer"]["emi"] or signals["extracted_offer"]["amount"]):
             t_delta += 0.2  # Bonus for structured offers
 
-        # Apply to state and clamp
-        self.anger = max(0.0, min(10.0, self.anger + a_delta))
-        self.trust = max(0.0, min(10.0, self.trust + t_delta))
-        self.fear = max(0.0, min(10.0, self.fear + f_delta))
+        # Apply to state — `_clamp_emotion` enforces both finiteness and
+        # the [0, 10] interval, falling back to the previous (good) value
+        # if the new one is somehow non-finite.
+        self.anger = _clamp_emotion(self.anger + a_delta, prev=self.anger)
+        self.trust = _clamp_emotion(self.trust + t_delta, prev=self.trust)
+        self.fear  = _clamp_emotion(self.fear  + f_delta, prev=self.fear)
 
     def _handle_demand_revelation(self) -> Optional[str]:
         """Checks if hidden demands should be revealed based on trust level."""
@@ -233,29 +302,34 @@ class BorrowerAdversary:
         # Time-out/Turns handled at the env.py level
 
     def _generate_response(self, signals: Dict[str, Any]) -> str:
-        """Determines the natural-language response of the borrower."""
-        
-        # map state to emotion zone
-        zone = "calm"
-        if self.fear > 7.0 or self.anger > 8.0:
-            zone = "panicked"
-        elif self.anger > 6.0:
-            zone = "angry"
-        elif self.anger > 3.0:
-            zone = "agitated"
+        """
+        Generate the borrower's natural-language reply for the current turn.
 
-        state_info = {
-            "anger": self.anger,
-            "trust": self.trust,
-            "fear": self.fear,
-            "zone": zone
-        }
+        Routes through the Hybrid-Dynamic voice (ResponseGenerator singleton):
+          • If NEG_LLM_ENABLED=1 and NVIDIA_API_KEY is set, NIM /
+            Llama-3.1-70B-Instruct produces a reply that reflects the
+            current Archetype (a function of self.anger / self.trust /
+            self.fear) and the agent's last message.  Replies are cached
+            by (Archetype, action_type) so the same emotional state +
+            agent intent re-uses an already-generated line, keeping
+            training-loop latency bounded.
+          • Otherwise (default for hermetic test runs and offline / CI), the
+            singleton transparently falls back to the deterministic
+            template bank via pick_template().
 
-        # Call response generator
-        response = pick_template(
-            signal_type=signals["primary_action_type"],
-            state_dict=state_info,
-            profile=self.profile
+        IMPORTANT: this function does NOT mutate self.* — it only reads
+        the state that _update_state has already committed.  The reward
+        signal is therefore independent of which voice path was used.
+        """
+        action_type = signals.get("primary_action_type", "unknown")
+
+        return get_response_generator().generate(
+            anger=self.anger,
+            trust=self.trust,
+            fear=self.fear,
+            action_type=action_type,
+            agent_text=self._last_agent_text,
+            profile=self.profile,
+            terminated=self.terminated,
+            termination_reason=self.termination_reason,
         )
-
-        return response
