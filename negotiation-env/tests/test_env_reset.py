@@ -5,15 +5,15 @@ from environment import config
 
 def test_reset_returns_valid_observation():
     env = NegotiationEnv()
-    obs_dict = env.reset()
+    obs = env.reset()
     
     # Check types and keys (matching models/observation.py)
-    assert isinstance(obs_dict.turn, int)
-    assert obs_dict.turn == 0
-    assert isinstance(obs_dict.borrower_msg, str)
-    assert len(obs_dict.borrower_msg) > 0
-    assert obs_dict.turns_remaining == config.MAX_TURNS
-    assert obs_dict.episode_id is not None
+    assert isinstance(obs.turn, int)
+    assert obs.turn == 0
+    assert isinstance(obs.borrower_msg, str)
+    assert len(obs.borrower_msg) > 0
+    assert obs.turns_remaining == config.MAX_TURNS
+    assert obs.episode_id is not None
 
 def test_reset_curriculum_fallback():
     env = NegotiationEnv()

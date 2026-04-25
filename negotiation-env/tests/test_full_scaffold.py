@@ -64,11 +64,11 @@ def run_check(description, test_func, is_critical=True):
     global passed, failed, failed_critical
     try:
         test_func()
-        print(f"  [✓] {description}")
+        print(f"  [OK] {description}")
         passed += 1
     except BaseException as e:
         err_msg = str(e) if str(e) else e.__class__.__name__
-        print(f"  [✗] {description} — ERROR: {err_msg}")
+        print(f"  [FAIL] {description} - ERROR: {err_msg}")
         failed += 1
         if is_critical:
             failed_critical += 1

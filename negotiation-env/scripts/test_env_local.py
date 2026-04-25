@@ -50,13 +50,13 @@ def t1_2():
     env = NegotiationEnv()
     obs = env.reset()
     assert obs is not None
-    assert isinstance(obs, dict)
+    assert hasattr(obs, "model_dump")
 
-run_check("env.reset() returns a dict", t1_2)
+run_check("env.reset() returns an Observation model", t1_2)
 
 def t1_3():
     env = NegotiationEnv()
-    obs = env.reset()
+    obs = env.reset().model_dump()
     for k in OBSERVATION_SCHEMA.keys():
         assert k in obs, f"Missing key: {k}"
 
@@ -64,7 +64,7 @@ run_check("reset() observation contains all OBSERVATION_SCHEMA keys", t1_3)
 
 def t1_4():
     env = NegotiationEnv()
-    obs = env.reset()
+    obs = env.reset().model_dump()
     assert isinstance(obs["turn"], int)
     assert isinstance(obs["borrower_msg"], str)
     assert isinstance(obs["escalation_level"], float)
@@ -75,10 +75,10 @@ run_check("reset() observation values have correct types", t1_4)
 
 def t1_5():
     env = NegotiationEnv()
-    obs1 = env.reset()
-    obs2 = env.reset()
+    obs1 = env.reset().model_dump()
+    obs2 = env.reset().model_dump()
     # Two resets should not share state
-    assert obs1["turn"] == obs2["turn"] == 1
+    assert obs1["turn"] == obs2["turn"] == 0
 
 run_check("Two consecutive reset() calls return clean state", t1_5)
 
@@ -218,8 +218,8 @@ def t3_3():
     env = NegotiationEnv()
     action = {"action_type": "send_message", "text": "I understand.", "metadata": {}}
     for ep in range(5):
-        obs = env.reset()
-        assert obs["turn"] == 1, f"Episode {ep}: turn did not reset to 1"
+        obs = env.reset().model_dump()
+        assert obs["turn"] == 0, f"Episode {ep}: turn did not reset to 0"
         for _ in range(20):
             obs, reward, done, info = env.step(action)
             if done:
@@ -301,7 +301,7 @@ def t4_4():
         "metadata": {}
     }
     _, _, _, info = env.step(empathy_action)
-    trust = info["reward_breakdown"].get("trust", 0.0)
+    trust = info["reward_breakdown"].get("trust_building", 0.0)
     assert trust >= 0.0, f"Expected non-negative trust reward for empathy, got {trust}"
 
 run_check("Empathetic action produces non-negative trust reward", t4_4)

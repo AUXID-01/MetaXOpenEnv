@@ -82,7 +82,7 @@ def test_react_threat_angry_scaling(profile_angry):
     reply, done, reason = adv.react("Pay or go to jail.", signals=signals)
     assert adv.anger >= 7.0
     assert done is True
-    assert reason == "escalation"
+    assert reason == "anger_threshold_crossed"
 
 def test_hidden_demand_reveal(profile_cooperative):
     adv = BorrowerAdversary(profile_cooperative)

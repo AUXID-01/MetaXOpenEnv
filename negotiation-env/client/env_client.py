@@ -9,28 +9,34 @@ from contracts import REWARD_BREAKDOWN_SCHEMA, TERMINATION_REASONS, OBSERVATION_
 
 DUMMY_EPISODE_ARC = [
     # index 0 — consumed by reset()
-    {"turn": 1, "borrower_msg": "I already told your colleagues, I can't pay anything right now.", 
-     "escalation_level": 3.0, "stated_demands": ["need 3 month moratorium"], "turns_remaining": 14, "reward": 0.1, "done": False},
+    {"turn": 1, "borrower_msg": "I already told your colleagues, I can't pay anything right now.",
+     "escalation_level": 3.0, "stated_demands": ["need 3 month moratorium"], "turns_remaining": 14,
+     "profile_context": "Dummy profile", "episode_id": "dummy-episode", "reward": 0.1, "done": False},
     
     # index 1 — step 1, done=False
     {"turn": 2, "borrower_msg": "Why do you people keep calling? I lost my job in January.",
-     "escalation_level": 5.5, "stated_demands": ["need 3 month moratorium", "reduce interest"], "turns_remaining": 13, "reward": -0.2, "done": False},
+     "escalation_level": 5.5, "stated_demands": ["need 3 month moratorium", "reduce interest"], "turns_remaining": 13,
+     "profile_context": "Dummy profile", "episode_id": "dummy-episode", "reward": -0.2, "done": False},
     
     # index 2 — step 2, done=False
     {"turn": 3, "borrower_msg": "My wife is unwell. If you can reduce the EMI I might manage something.",
-     "escalation_level": 4.0, "stated_demands": ["need 3 month moratorium", "reduce interest", "lower emi"], "turns_remaining": 12, "reward": 0.3, "done": False},
+     "escalation_level": 4.0, "stated_demands": ["need 3 month moratorium", "reduce interest", "lower emi"], "turns_remaining": 12,
+     "profile_context": "Dummy profile", "episode_id": "dummy-episode", "reward": 0.3, "done": False},
     
     # index 3 — step 3, done=False
     {"turn": 4, "borrower_msg": "What options do you have for me?",
-     "escalation_level": 3.0, "stated_demands": ["lower emi"], "turns_remaining": 11, "reward": 0.1, "done": False},
+     "escalation_level": 3.0, "stated_demands": ["lower emi"], "turns_remaining": 11,
+     "profile_context": "Dummy profile", "episode_id": "dummy-episode", "reward": 0.1, "done": False},
     
     # index 4 — step 4, commitment_reached
     {"turn": 5, "borrower_msg": "Okay. If you can make it 1800 per month for 6 months, I can try.",
-     "escalation_level": 2.0, "stated_demands": ["lower emi to 1800", "6 month plan"], "turns_remaining": 10, "reward": 1.0, "done": True},
+     "escalation_level": 2.0, "stated_demands": ["lower emi to 1800", "6 month plan"], "turns_remaining": 10,
+     "profile_context": "Dummy profile", "episode_id": "dummy-episode", "reward": 1.0, "done": True},
     
     # index 5 — timeout fallback
     {"turn": 6, "borrower_msg": "I need more time to think about this.",
-     "escalation_level": 9.0, "stated_demands": [], "turns_remaining": 0, "reward": 0.0, "done": True},
+     "escalation_level": 9.0, "stated_demands": [], "turns_remaining": 0,
+     "profile_context": "Dummy profile", "episode_id": "dummy-episode", "reward": 0.0, "done": True},
 ]
 
 class DummyEnvClient:
@@ -54,7 +60,8 @@ class DummyEnvClient:
                 "reward_breakdown": copy.deepcopy(REWARD_BREAKDOWN_SCHEMA),
                 "termination_reason": TERMINATION_REASONS[2],  # timeout
                 "anger_after": last.get("escalation_level", 0.0),
-                "trust_after": 5.0
+                "trust_after": 5.0,
+                "episode_id": "dummy-episode",
             }
             return obs, 0.0, True, info
             
@@ -66,15 +73,16 @@ class DummyEnvClient:
         termination_reason = None
         if done:
             if self.step_idx == 4:
-                termination_reason = TERMINATION_REASONS[2]  # timeout
-            else:
                 termination_reason = TERMINATION_REASONS[0]  # commitment_reached
+            else:
+                termination_reason = TERMINATION_REASONS[2]  # timeout
 
         info = {
             "reward_breakdown": copy.deepcopy(REWARD_BREAKDOWN_SCHEMA),
             "termination_reason": termination_reason,
             "anger_after": arc_step.get("escalation_level", 0.0),
-            "trust_after": 5.0
+            "trust_after": 5.0,
+            "episode_id": "dummy-episode",
         }
         
         # Make the breakdown a bit dynamic for the dummy

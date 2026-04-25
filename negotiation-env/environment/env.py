@@ -10,7 +10,7 @@ from environment.models.action import Action
 from environment.models.observation import Observation
 from environment.models.state import State
 from environment import config
-from reward import Rubric
+from rewards.rubric import Rubric
 
 """
 HOLDS: NegotiationEnv class.
@@ -46,13 +46,15 @@ class NegotiationEnv:
         self._agent_history: List[str] = []     # For anti-exploit check
         self._episode_id: str = ""
     
-    def reset(self, curriculum_stage: int | None = None) -> Dict[str, Any]:
+    def reset(self, curriculum_stage: int | None = None, stage: int | None = None) -> Observation:
         """
         Start a new episode.
         stage: curriculum stage (filters profiles by difficulty).
         Returns first observation for the LLM.
         """
         # Choose profile
+        if curriculum_stage is None and stage is not None:
+            curriculum_stage = stage
         if curriculum_stage is None:
             curriculum_stage = config.CURRICULUM_STAGE
         
@@ -68,7 +70,7 @@ class NegotiationEnv:
         self.rubric = Rubric(curriculum_stage=curriculum_stage)
         
         # Reset tracker values
-        self._turn = 1
+        self._turn = 0
         self._terminated = False
         self._termination_reason = ""
         self._episode_history = []
@@ -111,8 +113,7 @@ class NegotiationEnv:
             profile_context=f"{self._profile.get('name')}, {self._profile.get('reason')}, {self._profile.get('overdue_days')} days overdue",
             episode_id=self._episode_id
         )
-        
-        return obs.model_dump()
+        return obs
     
     def step(self, action_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
@@ -124,8 +125,18 @@ class NegotiationEnv:
             raise RuntimeError("Episode already terminated. Call reset().")
         
         self._turn += 1
-        action_text = action_dict.get("text", "")
-        action_type = action_dict.get("action_type", "unknown")
+        action_text = action_dict.get("text", "").strip()
+        action_type = action_dict.get("action_type", "send_message")
+        action_metadata = action_dict.get("metadata", {})
+        if not action_text:
+            action_text = "..."
+        if action_metadata is None:
+            action_metadata = {}
+        action_dict = {
+            "action_type": action_type,
+            "text": action_text,
+            "metadata": action_metadata,
+        }
         
         # Step 1: Classify the agent's action
         signals = classify_action(action_text)
@@ -199,10 +210,14 @@ class NegotiationEnv:
             "anger_after": round(self._adversary.anger, 2),
             "trust_after": round(self._adversary.trust, 2),
             "fear_after": round(self._adversary.fear, 2),
+            # Backward-compatible aliases used in legacy tests.
+            "anger": round(self._adversary.anger, 2),
+            "trust": round(self._adversary.trust, 2),
             "terminated": self._terminated,
             "termination_reason": self._termination_reason,
             "turn": self._turn,
             "profile_id": self._profile.get("id", "unknown"),
+            "episode_id": self._episode_id,
             "action_type": action_type,
             "signals": signals
         }

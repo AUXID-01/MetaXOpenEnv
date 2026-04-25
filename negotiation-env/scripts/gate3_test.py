@@ -31,8 +31,8 @@ def test_gate3():
     assert len(trajectory["completions"]) == trajectory["turns_taken"], "Completions length mismatch"
     assert len(trajectory["rewards"]) == trajectory["turns_taken"], "Rewards length mismatch"
     
-    # 3 dummy steps are expected because DUMMY_EPISODE_ARC length is 4 (1 reset, 3 steps)
-    assert trajectory["turns_taken"] == 3, f"Expected 3 dummy steps, got {trajectory['turns_taken']}"
+    # 4 dummy steps are expected with the current DUMMY_EPISODE_ARC.
+    assert trajectory["turns_taken"] == 4, f"Expected 4 dummy steps, got {trajectory['turns_taken']}"
     
     # Ensure tracking works correctly
     assert trajectory["final_anger"] is not None

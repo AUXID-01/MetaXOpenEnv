@@ -28,7 +28,8 @@ ACTION TYPE DEFINITIONS:
 - send_message: Use for general conversation. (Metadata: {{}})
 - offer_emi: Propose a specific structured repayment plan. (Metadata: {{"emi_amount": integer}})
 - acknowledge_hardship: Give an explicit empathy signal without proposing anything. (Metadata: {{}})
-- request_clarification: Ask the borrower for more details about their capacity. (Metadata: {{}})
+- ask_open_question: Ask the borrower for more details about their capacity. (Metadata: {{}})
+- confirm_in_writing: Explicitly offer written confirmation of next steps. (Metadata: {{}})
 - escalate_authority: Invoke a senior manager (risky, use sparingly). (Metadata: {{}})
 - stall: Buy time to think or process. (Metadata: {{}})
 """

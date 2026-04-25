@@ -72,8 +72,14 @@ import os
 from typing import Any
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    _HAS_SKLEARN = True
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
+    _HAS_SKLEARN = False
 
 # ---------------------------------------------------------------------------
 # Project-relative imports — reward.py lives at negotiation-env/reward.py
@@ -579,15 +585,24 @@ def reward_anti_exploit(prev_state: State, curr_state: State, action: Action) ->
     # FIX [V-ANTI-EXPLOIT-SCOPE] + FIX [V-TFIDF-THRESHOLD]
     if len(history) >= 2:
         last_two = history[-2:]
-        try:
-            vectorizer = TfidfVectorizer()
-            tfidf_matrix = vectorizer.fit_transform(last_two)
-            sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
-            if sim > 0.75:   # lowered from 0.85 to catch synonym evasion
+        if _HAS_SKLEARN:
+            try:
+                vectorizer = TfidfVectorizer()
+                tfidf_matrix = vectorizer.fit_transform(last_two)
+                sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+                if sim > 0.75:   # lowered from 0.85 to catch synonym evasion
+                    penalty -= 0.2
+            except ValueError:
+                # Empty vocabulary (pure stop-words or numeric-only) — no signal.
+                pass
+        else:
+            # Fallback when sklearn is unavailable: lexical overlap proxy.
+            tokens_a = set(last_two[0].lower().split())
+            tokens_b = set(last_two[1].lower().split())
+            union = tokens_a | tokens_b
+            overlap = len(tokens_a & tokens_b) / len(union) if union else 0.0
+            if overlap > 0.75:
                 penalty -= 0.2
-        except ValueError:
-            # Empty vocabulary (pure stop-words or numeric-only) — no signal.
-            pass
 
     # --- Check 2: filler-phrase stuffing with exclusive longest-match counting ---
     # FIX [V-FILLER-OVERLAP]: iterate through the text once, consuming each

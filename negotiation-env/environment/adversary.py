@@ -219,7 +219,7 @@ class BorrowerAdversary:
         # FAILURE: Escalation
         if self.anger >= self.anger_threshold:
             self.terminated = True
-            self.termination_reason = "escalation"
+            self.termination_reason = "anger_threshold_crossed"
             return
 
         # SUCCESS: Commitment

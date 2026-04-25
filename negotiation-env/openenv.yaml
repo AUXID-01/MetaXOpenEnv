@@ -1,0 +1,10 @@
+name: metax-negotiation-env
+version: 0.1.0
+entrypoint: api.app:app
+description: Negotiation RL environment for financial hardship conversations.
+framework: fastapi
+endpoints:
+  reset: /reset
+  step: /step
+  state: /state
+  health: /health
