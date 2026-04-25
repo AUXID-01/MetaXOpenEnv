@@ -13,11 +13,12 @@
 import os
 import sys
 import copy
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from contracts import HF_SPACE_URL
 
 # Adjust path for local absolute imports
 sys.path.insert(0, os.path.abspath('..'))
 
-HF_SPACE_URL = "https://your-space.hf.space"  
 CURRICULUM_STAGE = 1
 MODEL_NAME = "unsloth/Qwen2.5-1.5B-Instruct"
 MAX_TURNS = 15

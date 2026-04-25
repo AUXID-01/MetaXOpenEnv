@@ -1,5 +1,5 @@
 """Cross-team contracts used by environment, rewards, client, and training."""
-
+HF_SPACE_URL = "https://auxid01-metaxopenenv.hf.space"
 # Reward component keys used in reward breakdown logging.
 REWARD_BREAKDOWN_SCHEMA = {
     "outcome": 0.0,
@@ -90,4 +90,8 @@ if __name__ == "__main__":
         assert rng[0] < rng[1], f"Invalid range for {name}"
     for key in REWARD_BREAKDOWN_KEYS:
         assert f"reward/{key}" in WANDB_COLUMNS
+    print(f"  HF Space URL: {HF_SPACE_URL}")
+    assert HF_SPACE_URL.startswith("https://"), "Invalid URL"
+    assert "hf.space" in HF_SPACE_URL, "Not a HF Space URL"
+    print("  HF Space URL valid OK")
     print("All contracts valid OK")
