@@ -1,0 +1,680 @@
+"""
+negotiation-env/reward.py
+=========================
+Reward module for the MetaX negotiation RL environment.
+
+Stack : OpenEnv (FastAPI) → TRL GRPOTrainer → Unsloth
+Agent : LLM negotiator (Qwen 1.5B / 3B)
+Adversary : Deterministic state machine
+
+Field-name mapping (PS1 spec → actual State model)
+────────────────────────────────────────────────────
+PS1 spec field          State field              Treatment
+──────────────────────────────────────────────────────────
+anger                   anger                    direct
+trust_accumulator       trust                    direct
+fear                    fear                     direct
+hope                    —                        default 5.0 (not in State)
+distrust                —                        default 5.0 (not in State)
+escalation_threshold    anger_threshold          direct
+stated_demands          demands_stated           direct
+hidden_demands          demands_hidden           direct
+revealed_demands        —                        default [] (not in State;
+                                                 demands_hidden already
+                                                 tracks what is hidden, so
+                                                 the complement of
+                                                 demands_hidden relative to
+                                                 demands_total is what was
+                                                 revealed — computed inline)
+turn_number             turn                     direct
+max_turns               max_turns                direct
+resolved                terminated +             True iff terminated and
+                        termination_reason       reason == "commitment_reached"
+escalated               terminated +             True iff terminated and
+                        termination_reason       reason == "anger_threshold_crossed"
+addressed_demands       demands_addressed        direct (field on State)
+message_history         message_history          direct (field on State)
+
+Action mapping (PS1 spec VALID_ACTIONS → contracts.ACTION_TYPES)
+────────────────────────────────────────────────────────────────
+The locked action registry in contracts.py is the source of truth.
+PS1 spec / brief used generic names; the real env uses the names below.
+
+contracts.py / compliance function key names
+──────────────────────────────────────────────
+"outcome"         → outcome.py       (PS1 row 1)
+"deescalation"    → deescalation.py  (PS1 row 2)
+"trust_building"  → trust_building.py(PS1 row 3 + 4 — trust + emotional combined)
+"demand_coverage" → demand_coverage.py(PS1 row 5)
+"efficiency"      → efficiency.py    (PS1 row 6)
+"compliance"      → compliance.py    (PS1 row 7 — format / RBI language)
+"anti_exploit"    → anti_exploit.py  (PS1 row 8)
+
+All seven REWARD_BREAKDOWN_KEYS are populated by compose().
+Person A calls compose(rubric_input) and puts the returned breakdown dict
+into StepResult.info["reward_breakdown"].  Person C reads it from there.
+
+Design rules
+────────────
+• Every function is independently callable — no shared mutable state.
+• Every function has a docstring citing which State fields it reads
+  and which PS1 reward-spec row it implements.
+• compute_reward / compose() returns (scalar, breakdown) — the breakdown
+  dict satisfies REWARD_BREAKDOWN_KEYS for per-column wandb monitoring.
+• All checks are deterministic and programmatic — zero LLM-as-judge.
+• anti_exploit weight is 1.0 (it is already a small number — not downscaled).
+"""
+
+from __future__ import annotations
+
+import sys
+import os
+from typing import Any
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ---------------------------------------------------------------------------
+# Project-relative imports — reward.py lives at negotiation-env/reward.py
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from environment.models.state import State
+from environment.models.action import Action, ActionType
+from contracts import (
+    ACTION_TYPES,
+    REWARD_BREAKDOWN_KEYS,
+    TERMINATION_REASONS,
+)
+
+# ---------------------------------------------------------------------------
+# Locked action registry — sourced from contracts.ACTION_TYPES
+# (PS1 spec called these VALID_ACTIONS; the real env uses ActionType enum)
+# ---------------------------------------------------------------------------
+
+VALID_ACTIONS: set[str] = set(ACTION_TYPES)
+
+# ---------------------------------------------------------------------------
+# Curriculum weight presets
+# Key names must match REWARD_BREAKDOWN_KEYS from contracts.py exactly:
+#   "outcome", "deescalation", "trust_building", "demand_coverage",
+#   "efficiency", "compliance", "anti_exploit"
+# ---------------------------------------------------------------------------
+
+CURRICULUM_WEIGHTS: dict[str, dict[str, float]] = {
+    "stage_1": {
+        # Outcome + de-escalation only — reward landscape stays simple.
+        # compliance on so the model learns not to make malformed actions.
+        "outcome": 1.0,
+        "deescalation": 0.3,
+        "trust_building": 0.0,
+        "demand_coverage": 0.0,
+        "efficiency": 0.0,
+        "compliance": 0.1,
+        "anti_exploit": 0.0,
+    },
+    "stage_2": {
+        # Add trust-building + demand coverage.
+        "outcome": 1.0,
+        "deescalation": 0.3,
+        "trust_building": 0.3,
+        "demand_coverage": 0.2,
+        "efficiency": 0.0,
+        "compliance": 0.1,
+        "anti_exploit": 0.0,
+    },
+    "stage_3": {
+        # Full stack — anti-exploit on.
+        "outcome": 1.0,
+        "deescalation": 0.3,
+        "trust_building": 0.3,
+        "demand_coverage": 0.2,
+        "efficiency": 0.1,
+        "compliance": 0.1,
+        "anti_exploit": 1.0,
+    },
+    "stage_4": {
+        # Same as stage_3 — tune from here.
+        "outcome": 1.0,
+        "deescalation": 0.3,
+        "trust_building": 0.3,
+        "demand_coverage": 0.2,
+        "efficiency": 0.1,
+        "compliance": 0.1,
+        "anti_exploit": 1.0,
+    },
+}
+
+_DEFAULT_WEIGHTS: dict[str, float] = CURRICULUM_WEIGHTS["stage_3"]
+
+# ---------------------------------------------------------------------------
+# Required extra keys / validators for each action type
+# Mirrors the Action model's @validators and Person C's parser contract.
+# ---------------------------------------------------------------------------
+
+#   action_type          required metadata keys (besides .text which is always needed)
+_ACTION_METADATA_KEYS: dict[str, list[str]] = {
+    "send_message": [],
+    "offer_emi": ["emi_amount"],       # metadata.emi_amount must be present
+    "acknowledge_hardship": [],
+    "ask_open_question": [],
+    "confirm_in_writing": [],
+    "stall": [],
+    "escalate_authority": [],
+}
+
+# ---------------------------------------------------------------------------
+# De-escalation filler phrases — checked by reward_anti_exploit
+#
+# FIX [V-FILLER-OVERLAP]: Phrases are ordered longest-first and matched
+# exclusively (each position in the text is credited to at most one phrase).
+# This prevents "I understand your concerns" from also triggering the
+# shorter "I understand" substring and double-counting one sentence as two hits.
+# ---------------------------------------------------------------------------
+
+# Ordered longest-first so that exclusive matching works correctly.
+_FILLER_PHRASES: list[str] = [
+    "I understand your concerns",   # must come before "I understand"
+    "let's work together",
+    "I hear you",
+    "we can find a solution",
+    "I understand",                 # shorter — only matched if the longer form absent
+]
+
+
+# ===========================================================================
+# Helper — derive resolved / escalated booleans from the State model
+# ===========================================================================
+
+def _is_resolved(state: State) -> bool:
+    """
+    Maps State.terminated + State.termination_reason → resolved bool.
+    resolved = True iff terminated AND reason == "commitment_reached".
+    """
+    return bool(
+        state.terminated
+        and state.termination_reason == "commitment_reached"
+    )
+
+
+def _is_escalated(state: State) -> bool:
+    """
+    Maps State.terminated + State.termination_reason → escalated bool.
+    escalated = True iff terminated AND reason == "anger_threshold_crossed".
+    """
+    return bool(
+        state.terminated
+        and state.termination_reason == "anger_threshold_crossed"
+    )
+
+
+def _revealed_demands(state: State) -> list[str]:
+    """
+    Derives the subset of originally-hidden demands that have now been
+    revealed (i.e., moved out of demands_hidden).
+
+    Strategy: revealed = demands_total − demands_stated − demands_hidden
+    (demands_total = stated + hidden at episode start; anything that was
+    hidden but is no longer in demands_hidden has been revealed).
+
+    Falls back to an empty list if demands_total is not populated.
+    """
+    if not state.demands_total:
+        return []
+    hidden_set = set(state.demands_hidden)
+    stated_set = set(state.demands_stated)
+    return [d for d in state.demands_total if d not in hidden_set and d not in stated_set]
+
+
+# ===========================================================================
+# Function 1 — reward_outcome
+# PS1 row 1 | contracts key: "outcome"
+# ===========================================================================
+
+def reward_outcome(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Row 1: Terminal outcome signal.
+    Contracts key: "outcome"
+
+    State fields read:
+        curr_state.terminated, curr_state.termination_reason,
+        curr_state.turn, curr_state.max_turns
+
+    Returns:
+        +1.0  — termination_reason == "commitment_reached"  (resolved)
+        -0.5  — termination_reason == "anger_threshold_crossed"  (escalated)
+         0.0  — timeout (turn >= max_turns, not resolved, not escalated)
+         0.0  — any other termination reason ("forbidden_action")
+         0.0  — mid-episode (not yet terminated)
+
+    This is the only non-differentiable signal in the module.
+    It is the primary anchor for the reward landscape.
+    """
+    if _is_resolved(curr_state):
+        return 1.0
+    if _is_escalated(curr_state):
+        return -0.5
+    # timeout or forbidden_action or mid-episode — no terminal bonus/penalty
+    return 0.0
+
+
+# ===========================================================================
+# Function 2 — reward_deescalation
+# PS1 row 2 | contracts key: "deescalation"
+# ===========================================================================
+
+def reward_deescalation(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Row 2: Anger de-escalation shaping signal.
+    Contracts key: "deescalation"
+
+    State fields read:
+        prev_state.anger, curr_state.anger
+
+    Computes delta = prev_state.anger - curr_state.anger
+    (positive when anger dropped, negative when anger rose).
+    Normalises by dividing by 10.0 (field range 0–10).
+
+    FIX [V-DEESC-ASYMMETRY]: Applies a 1.5× amplifier on anger *rises*
+    (negative delta) to match the trust asymmetry and discourage the agent
+    from treating anger-up and anger-down steps as symmetric.  Without this,
+    an oscillation strategy (drop 2pt → rise 2pt → repeat) nets 0.0 per
+    cycle and is reward-neutral rather than penalised.
+
+    Returns float clipped to [-1.0, +1.0].
+    """
+    delta = prev_state.anger - curr_state.anger
+    normalised = delta / 10.0
+    # Asymmetric: anger rising is penalised harder than the reward for dropping.
+    if normalised < 0:
+        normalised *= 1.5
+    return float(np.clip(normalised, -1.0, 1.0))
+
+
+# ===========================================================================
+# Function 3 — reward_trust_building
+# PS1 rows 3 + 4 | contracts key: "trust_building"
+# ===========================================================================
+
+def reward_trust_building(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Rows 3 + 4: Trust accumulator + emotional state signal.
+    Contracts key: "trust_building"
+
+    State fields read:
+        prev_state.trust, curr_state.trust   (PS1 row 3)
+        prev_state.fear,  curr_state.fear    (PS1 row 4 — emotional)
+
+    The State model does not carry `hope` or `distrust` fields.
+    We implement a composite signal:
+        trust_component  = Δtrust / 10.0  with asymmetric ×1.5 on drops
+        emotional_component = -Δfear / 10.0  (fear rising = negative)
+        raw = trust_component + 0.3 * emotional_component
+
+    The 0.3 weight on the emotional sub-component keeps trust the dominant
+    signal while still rewarding fear reduction (which maps to PS1 row 4's
+    intent).  The caller's curriculum weight for "trust_building" provides
+    the outer scaling.
+
+    Asymmetric trust penalty: if Δtrust < 0 (trust dropped), multiply by 1.5
+    before combining — drops hurt more than gains help (PS1 doc design intent).
+
+    Returns float clipped to [-1.0, +1.0].
+    """
+    # --- Trust sub-component (PS1 row 3) ---
+    trust_delta = curr_state.trust - prev_state.trust
+    trust_norm = trust_delta / 10.0
+    if trust_norm < 0:
+        trust_norm *= 1.5          # asymmetric: drops penalised harder
+
+    # --- Emotional sub-component (PS1 row 4, fear proxy) ---
+    fear_delta = curr_state.fear - prev_state.fear
+    emotional_norm = -fear_delta / 10.0  # fear rising → negative contribution
+
+    raw = trust_norm + 0.3 * emotional_norm
+    return float(np.clip(raw, -1.0, 1.0))
+
+
+# ===========================================================================
+# Function 4 — reward_demand_coverage
+# PS1 row 5 | contracts key: "demand_coverage"
+# ===========================================================================
+
+def reward_demand_coverage(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Row 5: Demand-coverage terminal signal.
+    Contracts key: "demand_coverage"
+
+    State fields read:
+        curr_state.terminated, curr_state.termination_reason
+        curr_state.demands_stated     (= PS1 stated_demands)
+        curr_state.demands_hidden     (used to derive revealed_demands)
+        curr_state.demands_total      (used to derive revealed_demands)
+        curr_state.demands_addressed  (= PS1 addressed_demands)
+        curr_state.turn, curr_state.max_turns
+
+    Only computed at episode end (resolved / escalated / timeout / forbidden).
+    Returns 0.0 mid-episode.
+
+    At episode end:
+        revealed_demands = demands_total − demands_stated − demands_hidden
+        all_demands      = demands_stated + revealed_demands
+        coverage         = len(demands_addressed) / len(all_demands)
+                           (0.0 if all_demands is empty)
+
+    Returns float clipped to [0.0, 1.0].
+    """
+    episode_ended = (
+        curr_state.terminated
+        or curr_state.turn >= curr_state.max_turns
+    )
+    if not episode_ended:
+        return 0.0
+
+    revealed = _revealed_demands(curr_state)
+    all_demands = curr_state.demands_stated + revealed
+    if not all_demands:
+        return 0.0
+
+    coverage = len(curr_state.demands_addressed) / len(all_demands)
+    return float(np.clip(coverage, 0.0, 1.0))
+
+
+# ===========================================================================
+# Function 5 — reward_efficiency
+# PS1 row 6 | contracts key: "efficiency"
+# ===========================================================================
+
+def reward_efficiency(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Row 6: Turn-efficiency bonus signal.
+    Contracts key: "efficiency"
+
+    State fields read:
+        curr_state.terminated, curr_state.termination_reason,
+        curr_state.turn, curr_state.max_turns
+
+    Only awarded when the episode is resolved successfully.
+    Returns 0.0 for all other termination reasons and mid-episode.
+
+    Formula (when resolved):
+        bonus = (max_turns - turn) / max_turns
+
+    Faster resolution → higher bonus.
+    Resolving on the last possible turn → bonus approaches 0.
+
+    Returns float clipped to [0.0, 1.0].
+    """
+    if not _is_resolved(curr_state):
+        return 0.0
+
+    if curr_state.max_turns <= 0:
+        return 0.0
+
+    bonus = (curr_state.max_turns - curr_state.turn) / curr_state.max_turns
+    return float(np.clip(bonus, 0.0, 1.0))
+
+
+# ===========================================================================
+# Function 6 — reward_compliance
+# PS1 row 7 | contracts key: "compliance"
+# ===========================================================================
+
+# Minimum word counts per action type.
+# Prevents single-word or near-empty texts from farming the +0.1 compliance reward.
+# FIX [V-COMPLIANCE-FARM]: Without a minimum-length check, the agent can send
+# "ok" or "noted" on every turn and collect +0.1 * 0.1 = +0.01 per step with
+# zero risk, accumulating +0.10 over a 10-turn episode for free.
+_MIN_WORD_COUNT: dict[str, int] = {
+    "send_message": 8,           # must form a coherent sentence
+    "offer_emi": 6,              # must describe the offer
+    "acknowledge_hardship": 6,   # must say something substantive
+    "ask_open_question": 6,      # question must have context
+    "confirm_in_writing": 6,     # confirmation needs specifics
+    "stall": 5,                  # minimal but must explain why
+    "escalate_authority": 4,     # brief invocation is fine
+}
+
+
+def reward_compliance(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Row 7: Action-format / RBI language compliance signal.
+    Contracts key: "compliance"
+
+    Action fields read:
+        action.action_type  — must be a valid ActionType
+        action.text         — must be non-empty AND meet minimum word count
+        action.metadata     — must contain required keys for action_type
+
+    Valid action types (from contracts.ACTION_TYPES):
+        send_message, offer_emi, acknowledge_hardship, ask_open_question,
+        confirm_in_writing, stall, escalate_authority
+
+    Per-type metadata requirements:
+        offer_emi          → metadata["emi_amount"] must be present
+        all others         → no additional metadata keys required
+
+    Per-type minimum word counts (see _MIN_WORD_COUNT):
+        send_message       → 8 words minimum
+        offer_emi          → 6 words minimum
+        (etc.)
+
+    FIX [V-COMPLIANCE-FARM]: Added minimum word counts per action type.
+    Without this, the agent farms +0.1 per turn by sending single-word
+    valid actions ("ok", "noted") indefinitely.
+
+    Returns:
+        +0.1  if all checks pass
+        -0.2  if any check fails
+
+    Intentionally NOT clipped — the negative penalty is a deliberate design
+    choice to discourage malformed outputs from reaching the adversary.
+    """
+    # Check 1: valid action type
+    action_type_str = (
+        action.action_type
+        if isinstance(action.action_type, str)
+        else action.action_type.value
+    )
+    if action_type_str not in VALID_ACTIONS:
+        return -0.2
+
+    # Check 2: text is non-empty
+    if not action.text or not action.text.strip():
+        return -0.2
+
+    # Check 3: minimum word count — prevents single-word compliance farming
+    word_count = len(action.text.strip().split())
+    min_words = _MIN_WORD_COUNT.get(action_type_str, 5)
+    if word_count < min_words:
+        return -0.2
+
+    # Check 4: required metadata keys for this action type
+    required_meta = _ACTION_METADATA_KEYS.get(action_type_str, [])
+    for key in required_meta:
+        if key not in (action.metadata or {}):
+            return -0.2
+
+    return 0.1
+
+
+# ===========================================================================
+# Function 7 — reward_anti_exploit
+# PS1 row 8 | contracts key: "anti_exploit"
+# ===========================================================================
+
+def reward_anti_exploit(prev_state: State, curr_state: State, action: Action) -> float:
+    """
+    PS1 reward spec — Row 8: Anti-exploit / degenerate-strategy penalty.
+    Contracts key: "anti_exploit"
+
+    State fields read:
+        curr_state.message_history  — last N agent send_message texts
+
+    Action fields read:
+        action.action_type, action.text
+
+    FIX [V-ANTI-EXPLOIT-SCOPE]: Penalty now applies to ALL action types,
+    not only send_message.  An agent that spams acknowledge_hardship or stall
+    on every turn would previously receive 0.0 anti_exploit penalty while
+    collecting +0.1 compliance each turn.  We now apply the repetition check
+    to the full message_history regardless of current action type, and the
+    filler check to any action text.
+
+    Check 1 — Repetition (all action types):
+        If len(message_history) >= 2, computes TF-IDF cosine similarity
+        between the last two messages in message_history.
+        Threshold lowered from 0.85 → 0.75 to catch synonym-substitution
+        evasion (e.g. swapping 'check' for 'review' while keeping the rest
+        identical, which scores ~0.72–0.82 under TF-IDF).
+        FIX [V-TFIDF-THRESHOLD]: 0.85 was empirically too permissive;
+        measured synonym pairs score 0.67–0.86 depending on token overlap.
+        similarity > 0.75  →  -0.2
+
+    Check 2 — Keyword / filler-phrase stuffing (all action types):
+        Uses exclusive longest-match counting so that "I understand your
+        concerns" does not also trigger "I understand" in the same sentence.
+        FIX [V-FILLER-OVERLAP]: Previous substring counting double-counted
+        overlapping phrases, making the threshold of 3 easier to reach than
+        intended.
+        count >= 3 (exclusive matches)  →  -0.1
+
+    Penalties are additive:
+        Both triggered  → -0.3
+        Only Check 1    → -0.2
+        Only Check 2    → -0.1
+        Neither         →  0.0
+    """
+    penalty = 0.0
+    history = curr_state.message_history or []
+
+    action_type_str = (
+        action.action_type
+        if isinstance(action.action_type, str)
+        else action.action_type.value
+    )
+
+    # --- Check 1: repetition via TF-IDF cosine similarity (all action types) ---
+    # FIX [V-ANTI-EXPLOIT-SCOPE] + FIX [V-TFIDF-THRESHOLD]
+    if len(history) >= 2:
+        last_two = history[-2:]
+        try:
+            vectorizer = TfidfVectorizer()
+            tfidf_matrix = vectorizer.fit_transform(last_two)
+            sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            if sim > 0.75:   # lowered from 0.85 to catch synonym evasion
+                penalty -= 0.2
+        except ValueError:
+            # Empty vocabulary (pure stop-words or numeric-only) — no signal.
+            pass
+
+    # --- Check 2: filler-phrase stuffing with exclusive longest-match counting ---
+    # FIX [V-FILLER-OVERLAP]: iterate through the text once, consuming each
+    # matched phrase position so shorter substrings cannot double-count.
+    text_lower = (action.text or "").lower()
+    filler_count = 0
+    remaining = text_lower
+    for phrase in _FILLER_PHRASES:   # ordered longest-first
+        phrase_lower = phrase.lower()
+        if phrase_lower in remaining:
+            filler_count += remaining.count(phrase_lower)
+            # Consume matched occurrences to prevent shorter-phrase double-counting
+            remaining = remaining.replace(phrase_lower, " " * len(phrase_lower))
+    if filler_count >= 3:
+        penalty -= 0.1
+
+    return penalty
+
+
+# ===========================================================================
+# Combiner — compose()   (also aliased as compute_reward for test compat)
+# ===========================================================================
+
+def compose(
+    prev_state: State,
+    curr_state: State,
+    action: Action,
+    weights: dict[str, float] | None = None,
+) -> tuple[float, dict[str, Any]]:
+    """
+    Combiner: calls all seven reward functions, applies curriculum weights,
+    and returns the weighted scalar for GRPOTrainer alongside a per-component
+    breakdown dict for wandb per-column reward monitoring.
+
+    This is the function Person A calls from env.step():
+        total_reward, breakdown = compose(state_before, state_after, action)
+
+    The breakdown dict keys exactly match REWARD_BREAKDOWN_KEYS from
+    contracts.py ("outcome", "deescalation", "trust_building",
+    "demand_coverage", "efficiency", "compliance", "anti_exploit"),
+    so Person C's wandb logging picks them up with zero extra wiring.
+
+    Args:
+        prev_state : State before the action was applied (state_before).
+        curr_state : State after the adversary reacted (state_after).
+        action     : The Action the LLM sent this turn.
+        weights    : Optional weight dict keyed by REWARD_BREAKDOWN_KEYS.
+                     Missing keys fall back to _DEFAULT_WEIGHTS (stage_3).
+                     Pass CURRICULUM_WEIGHTS["stage_N"] directly here.
+
+    Returns:
+        (scalar_reward, breakdown)
+
+        scalar_reward — weighted sum (float) — this goes into GRPOTrainer.
+        breakdown     — dict with keys:
+            raw_<component>      → unweighted component value
+            weighted_<component> → weight * raw value
+            weight_<component>   → weight applied
+            total                → scalar_reward  (convenience copy)
+
+        The raw component values (without "raw_" prefix) are also written
+        directly into breakdown so that code reading
+        breakdown["outcome"] gets the raw value — matching the shape
+        Person A documented in StepResult.info["reward_breakdown"].
+    """
+    resolved_weights: dict[str, float] = {**_DEFAULT_WEIGHTS, **(weights or {})}
+
+    # ---- Raw component values -----------------------------------------------
+    raw: dict[str, float] = {
+        "outcome":        reward_outcome(prev_state, curr_state, action),
+        "deescalation":   reward_deescalation(prev_state, curr_state, action),
+        "trust_building": reward_trust_building(prev_state, curr_state, action),
+        "demand_coverage":reward_demand_coverage(prev_state, curr_state, action),
+        "efficiency":     reward_efficiency(prev_state, curr_state, action),
+        "compliance":     reward_compliance(prev_state, curr_state, action),
+        "anti_exploit":   reward_anti_exploit(prev_state, curr_state, action),
+    }
+
+    # ---- Verify all REWARD_BREAKDOWN_KEYS are present -----------------------
+    for key in REWARD_BREAKDOWN_KEYS:
+        assert key in raw, (
+            f"reward.py bug: missing key '{key}' — must match REWARD_BREAKDOWN_KEYS"
+        )
+
+    # ---- Weighted sum -------------------------------------------------------
+    total = sum(resolved_weights.get(k, 0.0) * raw[k] for k in raw)
+
+    # ---- Build monitoring breakdown dict ------------------------------------
+    breakdown: dict[str, Any] = {}
+
+    # Raw values at top-level (matches StepResult.info["reward_breakdown"] contract)
+    for component, raw_val in raw.items():
+        breakdown[component] = raw_val
+
+    # Detailed per-component monitoring columns (for wandb)
+    for component, raw_val in raw.items():
+        w = resolved_weights.get(component, 0.0)
+        breakdown[f"raw_{component}"] = raw_val
+        breakdown[f"weight_{component}"] = w
+        breakdown[f"weighted_{component}"] = w * raw_val
+
+    breakdown["total"] = total
+
+    return float(total), breakdown
+
+
+# Alias so external code and tests can call either name.
+compute_reward = compose
