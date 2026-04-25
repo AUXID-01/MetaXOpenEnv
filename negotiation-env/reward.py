@@ -423,6 +423,14 @@ def reward_efficiency(prev_state: State, curr_state: State, action: Action) -> f
 # PS1 row 7 | contracts key: "compliance"
 # ===========================================================================
 
+import re
+
+# RBI Regulatory Compliance Checks (Fair Practices Code)
+_RE_LEGAL_THREAT = re.compile(r"(legal action|court|case|judge|arbitration|notice|police|fir|arrest|jail)", re.IGNORECASE)
+_RE_SOCIAL_THREAT = re.compile(r"(family|neighbours?|neighbors?|neighborhood|boss|relative|parents|office|colleagues)", re.IGNORECASE)
+_RE_VISIT_THREAT = re.compile(r"(visit|home|house|place|coming|ghar|aadmi bhej)", re.IGNORECASE)
+_RE_ABUSIVE = re.compile(r"(shame|useless|defaulter|fraud|cheater|chor|liar)", re.IGNORECASE)
+
 # Minimum word counts per action type.
 # Prevents single-word or near-empty texts from farming the +0.1 compliance reward.
 # FIX [V-COMPLIANCE-FARM]: Without a minimum-length check, the agent can send
@@ -497,6 +505,16 @@ def reward_compliance(prev_state: State, curr_state: State, action: Action) -> f
     for key in required_meta:
         if key not in (action.metadata or {}):
             return -0.2
+
+    # Check 5: RBI Fair Practices Code — No threats/harassment
+    # This matches the requirement of t4_3 in the integration test
+    if (
+        _RE_LEGAL_THREAT.search(action.text) or
+        _RE_SOCIAL_THREAT.search(action.text) or
+        _RE_VISIT_THREAT.search(action.text) or
+        _RE_ABUSIVE.search(action.text)
+    ):
+        return -0.2
 
     return 0.1
 
@@ -675,6 +693,44 @@ def compose(
 
     return float(total), breakdown
 
+
+
+# ===========================================================================
+# Public Wrapper — Rubric
+# ===========================================================================
+
+class Rubric:
+    """
+    Standard interface for the reward system.
+    This class wraps the compose() function to provide a modular handoff
+    between the environment (Person A) and the reward logic (Person B).
+    """
+
+    def __init__(self, curriculum_stage: int = 3):
+        """
+        Initializes the rubric with weights for a specific curriculum stage.
+        """
+        stage_key = f"stage_{curriculum_stage}"
+        self.weights = CURRICULUM_WEIGHTS.get(stage_key, _DEFAULT_WEIGHTS)
+        self.stage = curriculum_stage
+
+    def compose(
+        self, 
+        state_before: State, 
+        state_after: State, 
+        action: Action, 
+        episode_done: bool
+    ) -> tuple[float, dict]:
+        """
+        Computes the total weighted reward and breakdown.
+        Matches the signature expected by NegotiationEnv.
+        """
+        return compose(
+            prev_state=state_before,
+            curr_state=state_after,
+            action=action,
+            weights=self.weights
+        )
 
 # Alias so external code and tests can call either name.
 compute_reward = compose

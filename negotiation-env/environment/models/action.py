@@ -1,4 +1,4 @@
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional, Dict, Any
 from enum import Enum
  
@@ -17,20 +17,21 @@ class Action(BaseModel):
     Person C builds this. Person A consumes it in env.step().
     Person B reads action.text in compliance.py and anti_exploit.py.
     """
+    model_config = ConfigDict(use_enum_values=True)
+
     action_type : ActionType
     text        : str                            # the actual message text
-    metadata    : Optional[Dict[str, Any]] = {}  # e.g. {"emi_amount": 3000}
+    metadata    : Optional[Dict[str, Any]] = Field(default_factory=dict)  # e.g. {"emi_amount": 3000}
  
-    @validator("text")
+    @field_validator("text")
+    @classmethod
     def text_not_empty(cls, v):
         if not v or not v.strip():
             raise ValueError("Action text cannot be empty")
         return v.strip()
  
-    @validator("metadata", pre=True, always=True)
+    @field_validator("metadata", mode="before")
+    @classmethod
     def metadata_default(cls, v):
         return v or {}
- 
-    class Config:
-        use_enum_values = True   # serialises to string for JSON
  
