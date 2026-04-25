@@ -1,0 +1,90 @@
+
+Crisis Negotiation RL - End-to-End Stability Audit
+------------------------------------------------------------
+
+------------------------------------------------------------
+  1. ENVIRONMENT HEALTH
+------------------------------------------------------------
+  [PASS]  Health endpoint responds
+         Response: {'status': 'ok', 'mode': 'local'}
+
+------------------------------------------------------------
+  2. reset() CONTRACT
+------------------------------------------------------------
+  [PASS]  reset() returns required observation keys
+  [PASS]  reset() initial values are sane
+  [PASS]  reset() is callable multiple times without crash
+
+------------------------------------------------------------
+  3. step() CONTRACT
+------------------------------------------------------------
+  [PASS]  step() returns observation, reward, done
+  [PASS]  step() reward is numeric
+         Got: 0.025 (float)
+  [PASS]  step() done is boolean
+         Got: False (bool)
+  [PASS]  All primary action types accepted by step()
+         All passed: ['send_message', 'offer_emi', 'acknowledge_hardship', 'ask_open_question', 'stall']
+
+------------------------------------------------------------
+  4. ADVERSARY STATE MACHINE
+------------------------------------------------------------
+  [PASS]  Adversary state contains anger + trust fields
+         State keys: ['anger', 'trust', 'fear', 'real_emi_capacity', 'stated_capacity', 'loan_amount', 'demands_total', 'demands_stated', 'demands_hidden', 'demands_addressed', 'anger_threshold', 'turn', 'max_turns', 'terminated', 'termination_reason', 'message_history', 'profile_id', 'curriculum_stage', 'episode_id']
+  [PASS]  Anger increases on threatening message
+         anger: 2.8 -> 6.8
+  [WARN]  Trust does not drop on empathetic message
+         trust dropped: 3.0 -> 2.3 (check transition rules)
+
+------------------------------------------------------------
+  5. EPISODE TERMINATION
+------------------------------------------------------------
+  [PASS]  Episode terminates (timeout or resolution) within 30 turns
+         done=True after 6 steps
+  [PASS]  step() after done is safe
+         Env correctly raised RuntimeError (graceful rejection)
+
+------------------------------------------------------------
+  6. REWARD FUNCTION INTEGRITY
+------------------------------------------------------------
+  [PASS]  Per-step rewards stay within [-2, +2]
+         All rewards: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.01, 0.01, 0.01, 0.01, 1.01]
+  [PASS]  At least one non-zero reward per episode
+         Non-zero rewards: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.010000000000000002, 0.010000000000000002, 0.010000000000000002, 0.010000000000000002, 1.01]
+  [PASS]  Anti-repetition penalty drops reward on repeated messages
+         Rewards over repeated turns: [-0.052, -0.252, -0.252, -0.252, -0.739]
+  [PASS]  step() info exposes reward component breakdown
+         info keys: ['reward_breakdown', 'anger_after', 'trust_after', 'fear_after', 'anger', 'trust', 'terminated', 'termination_reason', 'turn', 'profile_id', 'episode_id', 'action_type', 'signals']
+
+------------------------------------------------------------
+  7. CURRICULUM
+------------------------------------------------------------
+  [PASS]  reset() accepts curriculum_stage
+
+------------------------------------------------------------
+  8. FULL EPISODE INTEGRATION
+------------------------------------------------------------
+  [PASS]  Full episode completes without crash
+         turns=6, total_reward=1.144, done_naturally=True
+  [PASS]  3 sequential episodes run without state leakage
+         Turns per episode: [13, 13, 13]
+
+------------------------------------------------------------
+  9. PERFORMANCE & EDGE CASES
+------------------------------------------------------------
+  [PASS]  step() average latency < 2s
+         Latencies (s): [0.001, 0.001, 0.001, 0.001, 0.001]  avg=0.001s
+  [PASS]  Empty message does not crash env
+         Returned: {'observation': {'turn': 1, 'borrower_msg': "I'm a bit confu
+  [PASS]  Very long message does not crash env
+
+------------------------------------------------------------
+  AUDIT SUMMARY
+------------------------------------------------------------
+  Total checks : 23
+  PASS         : 22
+  WARN         : 1  (non-blocking)
+  FAIL         : 0  (blocking)
+------------------------------------------------------------
+  [OK] Environment is STABLE. Safe to start training.
+

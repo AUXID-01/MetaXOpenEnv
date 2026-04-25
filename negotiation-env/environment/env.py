@@ -6,7 +6,7 @@ from environment.adversary import BorrowerAdversary
 from environment.classifier import classify_action
 from environment.scenarios.profiles import PROFILES
 from environment.scenarios.curriculum import get_profiles_for_stage
-from environment.models.action import Action
+from environment.models.action import Action, ActionType
 from environment.models.observation import Observation
 from environment.models.state import State
 from environment import config
@@ -130,6 +130,12 @@ class NegotiationEnv:
         action_metadata = action_dict.get("metadata", {})
         if not action_text:
             action_text = "..."
+        
+        # Robustness: ensure action_type is valid
+        valid_types = [t.value for t in ActionType]
+        if action_type not in valid_types:
+            action_type = "send_message"
+
         if action_metadata is None:
             action_metadata = {}
         action_dict = {

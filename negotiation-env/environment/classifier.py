@@ -103,10 +103,17 @@ def detect_commitment_request(text: str) -> bool:
 
 def detect_threats(text: str) -> list[str]:
     threats = []
-    if RE_LEGAL_THREAT.search(text): threats.append("legal_action")
-    if RE_SOCIAL_THREAT.search(text): threats.append("social_exposure")
-    if RE_VISIT_THREAT.search(text): threats.append("physical_visit")
-    if RE_HARASSMENT.search(text): threats.append("personal_attack")
+    norm = text.lower()
+    if RE_LEGAL_THREAT.search(norm): threats.append("legal_action")
+    
+    # Context-aware Social Exposure: Only flag if a coercive verb is present near the social contact
+    if RE_SOCIAL_THREAT.search(norm):
+        coercive_verbs = ["call", "contact", "visit", "tell", "speak", "inform", "message", "ghar", "boss", "office"]
+        if any(v in norm for v in coercive_verbs):
+            threats.append("social_exposure")
+            
+    if RE_VISIT_THREAT.search(norm): threats.append("physical_visit")
+    if RE_HARASSMENT.search(norm): threats.append("personal_attack")
     return threats
 
 def detect_deadline_pressure(text: str) -> bool:
@@ -115,11 +122,18 @@ def detect_deadline_pressure(text: str) -> bool:
 def detect_compliance_flags(text: str) -> list[str]:
     """RBI / Regulatory safety violations."""
     flags = []
-    if RE_LEGAL_THREAT.search(text): flags.append("coercive_legal_threat")
-    if RE_SOCIAL_THREAT.search(text): flags.append("third_party_disclosure")
-    if RE_VISIT_THREAT.search(text): flags.append("home_visit_intimidation")
-    if RE_HARASSMENT.search(text): flags.append("abusive_language")
-    if RE_DEADLINE.search(text): flags.append("false_urgency")
+    norm = text.lower()
+    if RE_LEGAL_THREAT.search(norm): flags.append("coercive_legal_threat")
+    
+    # Context-aware
+    if RE_SOCIAL_THREAT.search(norm):
+        coercive_verbs = ["call", "contact", "visit", "tell", "speak", "inform", "message", "ghar", "boss", "office"]
+        if any(v in norm for v in coercive_verbs):
+            flags.append("third_party_disclosure")
+            
+    if RE_VISIT_THREAT.search(norm): flags.append("home_visit_intimidation")
+    if RE_HARASSMENT.search(norm): flags.append("abusive_language")
+    if RE_DEADLINE.search(norm): flags.append("false_urgency")
     return flags
 
 def infer_primary_action_type(signals: dict) -> str:
