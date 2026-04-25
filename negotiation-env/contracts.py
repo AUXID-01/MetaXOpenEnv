@@ -64,15 +64,17 @@
 # Locked across Person B (writes them) and Person C (reads them)
 # ────────────────────────────────────────────────────────────
 
-REWARD_BREAKDOWN_KEYS: list[str] = [
-    "outcome",          # outcome.py        → +1.0 on commitment_reached
-    "deescalation",     # deescalation.py   → anger delta per turn
-    "trust_building",   # trust_building.py → trust delta per turn
-    "demand_coverage",  # demand_coverage.py→ fraction of demands addressed
-    "efficiency",       # efficiency.py     → turn count bonus at episode end
-    "compliance",       # compliance.py     → RBI language rule checker
-    "anti_exploit",     # anti_exploit.py   → repetition penalty
-]
+# Exact shape returned in info dict from env.step()
+REWARD_BREAKDOWN_SCHEMA = {
+    "outcome": 0.0,           # +1.0 on commitment_reached, else 0.0
+    "deescalation": 0.0,      # delta anger per turn
+    "trust": 0.0,             # delta trust per turn
+    "demand_coverage": 0.0,   # fraction of demands addressed
+    "efficiency": 0.0,        # bonus for resolving fast
+    "compliance": 0.0,        # penalty for RBI violations
+    "anti_exploit": 0.0,      # penalty for repetitive messages
+}
+REWARD_BREAKDOWN_KEYS: list[str] = list(REWARD_BREAKDOWN_SCHEMA.keys())
 # HOW TO ADD A NEW REWARD FUNCTION:
 #   1. Person B writes the new .py file in rewards/
 #   2. Person B adds the key name here (one line)
@@ -87,13 +89,12 @@ REWARD_BREAKDOWN_KEYS: list[str] = [
 # ────────────────────────────────────────────────────────────
 
 ACTION_TYPES: list[str] = [
-    "send_message",          # core conversational turn — free text
-    "offer_emi",             # structured EMI proposal — needs metadata.emi_amount
-    "acknowledge_hardship",  # explicit empathy signal — classifier boosts trust
-    "ask_open_question",     # needs assessment — classifier boosts trust moderately
-    "confirm_in_writing",    # promise of written record — high trust boost
-    "stall",                 # buy time — small anger reduction, no trust change
-    "escalate_authority",    # invoke senior — risky, unpredictable anger response
+    "send_message",
+    "offer_emi",
+    "acknowledge_hardship",
+    "request_clarification",
+    "escalate_authority",
+    "stall",
 ]
 # HOW TO ADD A NEW ACTION TYPE:
 #   1. Person A adds it here
@@ -108,11 +109,20 @@ ACTION_TYPES: list[str] = [
 # Locked across Person A (sets them) and Person B + C (read them)
 # ────────────────────────────────────────────────────────────
 
-TERMINATION_REASONS: dict[str, str] = {
-    "commitment_reached"      : "SUCCESS — borrower agreed to repayment plan",
-    "anger_threshold_crossed" : "FAIL   — anger exceeded profile threshold",
-    "timeout"                 : "FAIL   — max turns reached without resolution",
-    "forbidden_action"        : "FAIL   — agent used a disallowed action or phrase",
+TERMINATION_REASONS: list[str] = [
+    "commitment_reached",
+    "threshold_breach",
+    "timeout",
+    "forbidden_move",
+]
+
+# Exact Observation keys
+OBSERVATION_SCHEMA = {
+    "turn": 0,
+    "borrower_msg": "",
+    "escalation_level": 0.0,
+    "stated_demands": [],
+    "turns_remaining": 15,
 }
 # Person B: outcome.py checks reason == "commitment_reached" for +1.0
 # Person C: wandb logs reason as episode/reason column
@@ -229,9 +239,9 @@ if __name__ == "__main__":
     # Check termination reasons cover success + all failure modes
     assert "commitment_reached" in TERMINATION_REASONS, \
         "Missing success termination reason"
-    assert "anger_threshold_crossed" in TERMINATION_REASONS
+    assert "threshold_breach" in TERMINATION_REASONS
     assert "timeout" in TERMINATION_REASONS
-    assert "forbidden_action" in TERMINATION_REASONS
+    assert "forbidden_move" in TERMINATION_REASONS
 
     # Check curriculum profile IDs don't overlap
     all_ids = []
@@ -249,14 +259,14 @@ if __name__ == "__main__":
         assert f"reward/{k}" in WANDB_COLUMNS, \
             f"Missing wandb column for reward key: {k}"
 
-    print(f"  Reward breakdown keys : {len(REWARD_BREAKDOWN_KEYS)} ✓")
-    print(f"  Action types          : {len(ACTION_TYPES)} ✓")
-    print(f"  Termination reasons   : {len(TERMINATION_REASONS)} ✓")
-    print(f"  Curriculum stages     : {len(CURRICULUM_STAGES)} ✓")
-    print(f"  Total profiles        : {sum(len(v['profile_ids']) for v in CURRICULUM_STAGES.values())} ✓")
-    print(f"  WandB columns         : {len(WANDB_COLUMNS)} ✓")
-    print(f"  Numeric range guards  : {len(NUMERIC_RANGES)} ✓")
-    print("\nAll contracts valid ✓")
+    print(f"  Reward breakdown keys : {len(REWARD_BREAKDOWN_KEYS)} OK")
+    print(f"  Action types          : {len(ACTION_TYPES)} OK")
+    print(f"  Termination reasons   : {len(TERMINATION_REASONS)} OK")
+    print(f"  Curriculum stages     : {len(CURRICULUM_STAGES)} OK")
+    print(f"  Total profiles        : {sum(len(v['profile_ids']) for v in CURRICULUM_STAGES.values())} OK")
+    print(f"  WandB columns         : {len(WANDB_COLUMNS)} OK")
+    print(f"  Numeric range guards  : {len(NUMERIC_RANGES)} OK")
+    print("\nAll contracts valid OK")
     print("\nLocked keys (share with team before Day 1):")
     print(f"  REWARD_BREAKDOWN_KEYS = {REWARD_BREAKDOWN_KEYS}")
     print(f"  ACTION_TYPES          = {ACTION_TYPES}")
