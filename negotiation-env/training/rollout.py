@@ -9,7 +9,7 @@ from training.prompt_builder import build_system_prompt, build_turn_prompt
 from client.utils import action_from_text
 
 def run_episode(client, model_generate_fn, stage: int = 1, 
-                max_turns: int = 15, curriculum_stage=None, tokenizer=None) -> dict:
+                max_turns: int = 15, curriculum_stage=None, tokenizer=None, verbose: bool = False) -> dict:
     """
     Runs one full episode against the provided client. 
     Returns a trajectory dictionary shaped for GRPOTrainer or custom reward logic.
@@ -103,8 +103,9 @@ def run_episode(client, model_generate_fn, stage: int = 1,
             
         if "reward_breakdown" in info:
             for k, v in info["reward_breakdown"].items():
-                trajectory["reward_breakdown"][k] = \
-                    trajectory["reward_breakdown"].get(k, 0.0) + v
+                if not (k.startswith("weight_") or k.startswith("weighted_") or k.startswith("raw_")):
+                    trajectory["reward_breakdown"][k] = \
+                        trajectory["reward_breakdown"].get(k, 0.0) + v
             
         if done:
             trajectory["success"] = (info.get("termination_reason") == "commitment_reached")
@@ -116,11 +117,14 @@ def run_episode(client, model_generate_fn, stage: int = 1,
             break
             
         obs = next_obs
+        if not verbose:
+            print(".", end="", flush=True)
         
     # Addresses: Problem 3
     trajectory["per_turn_reward_breakdowns"] = per_turn_reward_breakdowns
     trajectory["per_turn_adversary_states"] = per_turn_adversary_states
-    print_episode_transcript(trajectory)
+    if verbose:
+        print_episode_transcript(trajectory)
     
     return trajectory
 

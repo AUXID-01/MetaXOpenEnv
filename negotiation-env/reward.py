@@ -706,7 +706,7 @@ def compose(
         Person A documented in StepResult.info["reward_breakdown"].
     """
     resolved_weights: dict[str, float] = {**_DEFAULT_WEIGHTS, **(weights or {})}
-    resolved_weights["format_compliance"] = 1.0 # Addresses: Problem 1
+    resolved_weights["format_compliance"] = 0.5 # Reduced weight to prevent dominant strategy
 
     # ---- Raw component values -----------------------------------------------
     raw: dict[str, float] = {

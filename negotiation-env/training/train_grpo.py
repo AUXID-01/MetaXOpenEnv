@@ -59,6 +59,9 @@ client = NegotiationEnv() # Direct instance for zero-latency training
 # %% [markdown]
 # ### Pre-Cell 6: Generation Wrapper
 # %%
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 def generate_action(prompt: str) -> str:
     """Wrapper to generate text using the loaded unsloth model."""
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
@@ -72,7 +75,7 @@ def generate_action(prompt: str) -> str:
 from training.rollout import run_episode
 
 # Run one episode and print the output exactly as we need it for debugging formatting.
-trajectory = run_episode(client, generate_action, stage=CURRICULUM_STAGE)
+trajectory = run_episode(client, generate_action, stage=CURRICULUM_STAGE, verbose=True)
 
 print(f"Turns taken: {trajectory['turns_taken']}")
 print(f"Total score: {trajectory['total_score']}")
@@ -103,7 +106,7 @@ from collections import deque
 
 reward_window = deque(maxlen=100)
 
-def collect_rollout_buffer(client, generate_fn, num_episodes: int = 8) -> Dataset:
+def collect_rollout_buffer(client, generate_fn, num_episodes: int = 2) -> Dataset:
     """
     Runs `num_episodes` full episodes and unpacks each turn
     into an independent (prompt, completion, reward) training example.
@@ -165,7 +168,7 @@ grpo_config = GRPOConfig(
     learning_rate=1e-5,
     max_prompt_length=2048,
     max_completion_length=200,
-    num_generations=8,       # rollouts per prompt
+    num_generations=4,       # rollouts per prompt
     beta=0.01,               # KL penalty — keep low initially
     logging_steps=10,
     save_steps=100,
@@ -173,8 +176,8 @@ grpo_config = GRPOConfig(
 )
 
 # --- Training Loop ---
-TRAIN_STEPS = 500
-ROLLOUT_EVERY = 50   # collect fresh episodes every N steps
+TRAIN_STEPS = 100
+ROLLOUT_EVERY = 20   # collect fresh episodes every N steps
 
 from training.curriculum_scheduler import CurriculumScheduler
 scheduler = CurriculumScheduler()
@@ -183,7 +186,7 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
     
     # 1. Collect fresh rollouts with current model
     print(f"[Step {step}] Collecting rollouts...")
-    buffer = collect_rollout_buffer(client, generate_action, num_episodes=8)
+    buffer = collect_rollout_buffer(client, generate_action, num_episodes=2)
     
     # 2. Train on buffer
     trainer = GRPOTrainer(
@@ -215,4 +218,4 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
     mean_reward_last_100 = sum(reward_window) / max(1, len(reward_window))
     if scheduler.advance_if_ready(mean_reward_last_100):
         print("Advancing curriculum stage!")
-        # CURRICULUM_STAGE += 1
+        CURRICULUM_STAGE += 1
