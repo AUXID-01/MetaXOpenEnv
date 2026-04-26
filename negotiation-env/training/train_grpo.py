@@ -29,8 +29,10 @@ MAX_TURNS = 15
 # ### Cell 3 — WandB Login
 # %%
 import wandb
-wandb.login()
-wandb.init(project="debt-negotiation-rl", config={
+# Colab/CI: set WANDB_MODE=disabled to skip auth (we still try/except log calls below).
+if os.environ.get("WANDB_MODE", "").lower() not in ("disabled", "offline"):
+    wandb.login()
+    wandb.init(project="debt-negotiation-rl", config={
     "model": MODEL_NAME,
     "max_turns": MAX_TURNS,
     "stage": CURRICULUM_STAGE
@@ -48,41 +50,20 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     max_seq_length=max_seq_length,
     load_in_4bit=load_in_4bit,
 )
-tokenizer.truncation_side = "left"
 
 # %% [markdown]
 # ### Cell 5 — Client Setup
 # %%
-# Use the FastAPI HTTP wrapper rather than the in-process NegotiationEnv:
-#
-#   • NegotiationEnv.reset() returns a Pydantic Observation object, but
-#     training/rollout.py expects a dict (it indexes obs["borrower_msg"]).
-#     Going through the HTTP layer JSON-serialises the Observation, which
-#     gives us the dict shape rollout.py wants.
-#   • Pulling the URL from $NEGOTIATION_ENV_URL keeps localhost out of the
-#     committed code so the same script runs unchanged in CI / Hugging
-#     Face Spaces / Kubernetes — just point the env var at the deployed
-#     server.
-#
-# Required: a FastAPI server (negotiation-env/api/app.py) running at the
-# configured URL. Start it locally with:
-#     cd negotiation-env && uvicorn api.app:app --port 8000
-from client.env_client import NegotiationEnvClient
-env_url = os.getenv("NEGOTIATION_ENV_URL", "http://127.0.0.1:8000")
-client = NegotiationEnvClient(env_url)
-print(f"[env] training client → {env_url}")
+from environment.env import NegotiationEnv
+client = NegotiationEnv() # Direct instance for zero-latency training
 
 # %% [markdown]
 # ### Pre-Cell 6: Generation Wrapper
 # %%
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
 def generate_action(prompt: str) -> str:
     """Wrapper to generate text using the loaded unsloth model."""
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-    # Increased max_new_tokens to 400 to prevent JSON truncation
-    outputs = model.generate(**inputs, max_new_tokens=400, temperature=0.7)
+    outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
     return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0][len(prompt):]
 
 # %% [markdown]
@@ -92,21 +73,11 @@ def generate_action(prompt: str) -> str:
 from training.rollout import run_episode
 
 # Run one episode and print the output exactly as we need it for debugging formatting.
-trajectory = run_episode(client, generate_action, stage=CURRICULUM_STAGE, verbose=True)
+trajectory = run_episode(client, generate_action, stage=CURRICULUM_STAGE)
 
 print(f"Turns taken: {trajectory['turns_taken']}")
 print(f"Total score: {trajectory['total_score']}")
 print(f"Format Fallbacks: {trajectory['parse_failures']}")
-
-# Addresses: Problem 4
-parse_failures = trajectory.get('parse_failures', 0)
-turns_taken = trajectory.get('turns_taken', 1)
-print(f"[SMOKE TEST] Format failure rate: {(parse_failures / max(1, turns_taken)) * 100:.1f}%")
-bd = trajectory.get('reward_breakdown', {})
-is_format_present = 'format_compliance' in bd
-print(f"format_compliance present in breakdown: {is_format_present}")
-if not is_format_present:
-    print("WARNING: format_compliance is missing from reward_breakdown! Task 1 did not wire correctly.")
 
 print("\n--- SAMPLE GENERATION (Turn 1 Baseline) ---")
 print("PROMPT IN:\n", trajectory["prompts"][0][:200], "...\n")
@@ -123,7 +94,7 @@ from collections import deque
 
 reward_window = deque(maxlen=100)
 
-def collect_rollout_buffer(client, generate_fn, num_episodes: int = 2) -> Dataset:
+def collect_rollout_buffer(client, generate_fn, num_episodes: int = 8) -> Dataset:
     """
     Runs `num_episodes` full episodes and unpacks each turn
     into an independent (prompt, completion, reward) training example.
@@ -176,25 +147,25 @@ def reward_fn_from_buffer(completions: list[str], **kwargs) -> list[float]:
     """
     return kwargs["reward"]  # pre-computed from rollout buffer
 
-# --- GRPO Config (Optimized for 4GB RTX 3050 Laptop) ---
+# --- GRPO Config (tuned for 1.5B model on Colab T4) ---
 grpo_config = GRPOConfig(
     output_dir="./grpo-debt-negotiator",
     num_train_epochs=1,
-    per_device_train_batch_size=1, # Reduced for 4GB VRAM
-    gradient_accumulation_steps=8, # Increased to maintain effective batch size
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=2,
     learning_rate=1e-5,
-    max_prompt_length=1024,        # Reduced for 4GB VRAM
-    max_completion_length=400,     # Increased to accommodate thought process + JSON
-    num_generations=2,             # Reduced for 4GB VRAM
-    beta=0.01,                     # KL penalty — keep low initially
+    max_new_tokens=150,
+    num_generations=8,       # rollouts per prompt
+    temperature=0.7,
+    beta=0.01,               # KL penalty — keep low initially
     logging_steps=10,
     save_steps=100,
 #   report_to="wandb",
 )
 
 # --- Training Loop ---
-TRAIN_STEPS = 100
-ROLLOUT_EVERY = 20   # collect fresh episodes every N steps
+TRAIN_STEPS = 500
+ROLLOUT_EVERY = 50   # collect fresh episodes every N steps
 
 from training.curriculum_scheduler import CurriculumScheduler
 scheduler = CurriculumScheduler()
@@ -203,7 +174,7 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
     
     # 1. Collect fresh rollouts with current model
     print(f"[Step {step}] Collecting rollouts...")
-    buffer = collect_rollout_buffer(client, generate_action, num_episodes=2)
+    buffer = collect_rollout_buffer(client, generate_action, num_episodes=8)
     
     # 2. Train on buffer
     trainer = GRPOTrainer(
@@ -212,27 +183,10 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
         train_dataset=buffer,
         reward_funcs=reward_fn_from_buffer,
     )
-    
-    # Addresses: Problem 4
-    if len(buffer) > 0:
-        print(f"Current step number: {step}")
-        print(f"Number of examples in the training buffer: {len(buffer)}")
-        print(f"Reward of the first example: {buffer[0]['reward']}")
-        all_rewards = buffer["reward"]
-        print(f"Min reward in buffer: {min(all_rewards)}")
-        print(f"Max reward in buffer: {max(all_rewards)}")
-    print("Starting GRPOTrainer.train()...")
-    
     trainer.train()
-    
-    # Addresses: Problem 4
-    print("GRPOTrainer.train() completed.")
-    mean_reward_computed = sum(reward_window) / max(1, len(reward_window))
-    print(f"Mean reward over last {len(reward_window)} episodes: {mean_reward_computed}")
-
     
     # 3. Check curriculum advance
     mean_reward_last_100 = sum(reward_window) / max(1, len(reward_window))
     if scheduler.advance_if_ready(mean_reward_last_100):
         print("Advancing curriculum stage!")
-        CURRICULUM_STAGE += 1
+        # CURRICULUM_STAGE += 1
