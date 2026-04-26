@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import copy
 
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -175,8 +176,16 @@ def print_episode_transcript(trajectory: dict):
         print(f"...{trim_prompt}")
         print("-" * 30)
         
-        print("[MODEL OUTPUT]:")
+        print("[RAW MODEL OUTPUT (UNFILTERED)]:")
         print(completions[i])
+        print("-" * 30)
+
+        # Silent parse for reward confirmation
+        action_dict = action_from_text(completions[i])
+        final_text = action_dict.get("text", "")
+        
+        print(f"[FINAL TEXT FOR REWARD]: '{final_text}'")
+        print(f"(Word Count: {len(final_text.split())})")
         print("-" * 30)
         
         reward_val = rewards[i]
@@ -187,8 +196,11 @@ def print_episode_transcript(trajectory: dict):
             print("[REWARD BREAKDOWN]:")
             for k, v in breakdowns[i].items():
                 if "total" not in k and "weight" not in k and not k.startswith("raw_"):
-                    v_sign = "+" if v >= 0 else ""
-                    print(f"  {k}: {v_sign}{v:.4f}")
+                    if isinstance(v, (int, float)):
+                        v_sign = "+" if v >= 0 else ""
+                        print(f"  {k}: {v_sign}{v:.4f}")
+                    else:
+                        print(f"  {k}: {v}")
                     
         if i < len(states):
             st = states[i]
@@ -210,7 +222,10 @@ def print_episode_transcript(trajectory: dict):
     
     print("\nEpisode-level reward breakdown:")
     for k, v in trajectory.get("reward_breakdown", {}).items():
-        v_sign = "+" if v >= 0 else ""
-        print(f"  {k}: {v_sign}{v:.4f}")
+        if isinstance(v, (int, float)):
+            v_sign = "+" if v >= 0 else ""
+            print(f"  {k}: {v_sign}{v:.4f}")
+        else:
+            print(f"  {k}: {v}")
         
     print("=" * 50 + "\n")

@@ -81,7 +81,8 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 def generate_action(prompt: str) -> str:
     """Wrapper to generate text using the loaded unsloth model."""
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-    outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
+    # Increased max_new_tokens to 400 to prevent JSON truncation
+    outputs = model.generate(**inputs, max_new_tokens=400, temperature=0.7)
     return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0][len(prompt):]
 
 # %% [markdown]
@@ -175,17 +176,17 @@ def reward_fn_from_buffer(completions: list[str], **kwargs) -> list[float]:
     """
     return kwargs["reward"]  # pre-computed from rollout buffer
 
-# --- GRPO Config (tuned for 1.5B model on Colab T4) ---
+# --- GRPO Config (Optimized for 4GB RTX 3050 Laptop) ---
 grpo_config = GRPOConfig(
     output_dir="./grpo-debt-negotiator",
     num_train_epochs=1,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=2,
+    per_device_train_batch_size=1, # Reduced for 4GB VRAM
+    gradient_accumulation_steps=8, # Increased to maintain effective batch size
     learning_rate=1e-5,
-    max_prompt_length=2048,
-    max_completion_length=200,
-    num_generations=4,       # rollouts per prompt
-    beta=0.01,               # KL penalty — keep low initially
+    max_prompt_length=1024,        # Reduced for 4GB VRAM
+    max_completion_length=400,     # Increased to accommodate thought process + JSON
+    num_generations=2,             # Reduced for 4GB VRAM
+    beta=0.01,                     # KL penalty — keep low initially
     logging_steps=10,
     save_steps=100,
 #   report_to="wandb",
