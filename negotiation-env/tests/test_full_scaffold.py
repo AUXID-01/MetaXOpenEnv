@@ -178,51 +178,65 @@ def run_all_tests():
         assert hasattr(rec.NegotiationEnvClient, "reset"), "Missing reset()"
         assert hasattr(rec.NegotiationEnvClient, "step"), "Missing step()"
     run_check("NegotiationEnvClient class exists and has reset() and step() methods", t2_7)
-    print("\nSECTION 3 — XML PARSER (client/utils.py)")
-    
+    print("\nSECTION 3 — JSON PARSER (client/utils.py)")
+
     def t3_1():
         cu = get_client_utils()
-        xml = "<action_type>offer_emi</action_type>\n<text>Here is 500</text>\n<metadata>{\"amount\": 500}</metadata>"
-        res = cu.parse_action_xml(xml)
+        # Valid JSON with all four contract keys.
+        text = '{"action_type": "offer_emi", "text": "Here is 500", "metadata": {"amount": 500}}'
+        res = cu.parse_action_xml(text)   # alias of action_from_text — kept for back-compat
         assert res["action_type"] == "offer_emi", res["action_type"]
         assert res["text"] == "Here is 500", res["text"]
-        assert res["metadata"] == {"amount": 500}, res["metadata"]
-    run_check("Valid XML parsed correctly — action_type, text, metadata all extracted", t3_1)
+        # Parser also injects metadata["raw_text"] for the format-compliance reward;
+        # the user-facing keys must still survive intact.
+        assert res["metadata"].get("amount") == 500, res["metadata"]
+    run_check("Valid JSON parsed correctly — action_type, text, metadata all extracted", t3_1)
     def t3_2():
         cu = get_client_utils()
-        xml = "Before\n<action_type>offer_emi</action_type>\n<text>Hey</text>\n<metadata>{}</metadata>\nAfter"
-        res = cu.parse_action_xml(xml)
+        # Greedy {.*} regex must skip chatty preamble/suffix.
+        text = 'Sure, here is my response:\n{"action_type": "offer_emi", "text": "Hey", "metadata": {}}\nThanks!'
+        res = cu.parse_action_xml(text)
         assert res["action_type"] == "offer_emi"
         assert res["text"] == "Hey"
-    run_check("Messy output with text before and after tags still parsed correctly", t3_2)
+    run_check("Messy output with text before and after JSON object still parsed correctly", t3_2)
     def t3_3():
         cu = get_client_utils()
-        xml = "<action_type>offer"
-        res = cu.parse_action_xml(xml)
+        # Truncated mid-object → JSONDecodeError → safe fallback (text="").
+        text = '{"action_type": "offer'
+        res = cu.parse_action_xml(text)
         assert res["action_type"] == "send_message", f"Got {res.get('action_type')}"
-    run_check("Missing closing tag falls back to send_message gracefully", t3_3)
+        # Critical anti-leak invariant: monologue text must NOT be copied to text.
+        assert res["text"] == "", f"Internal monologue leaked into text: {res.get('text')!r}"
+    run_check("Truncated mid-object JSON falls back to send_message with empty text (no leak)", t3_3)
     def t3_4():
         cu = get_client_utils()
-        xml = "<action_type>invalid_magic</action_type>\n<text>hello</text>\n<metadata>{}</metadata>"
-        res = cu.parse_action_xml(xml)
+        text = '{"action_type": "invalid_magic", "text": "hello", "metadata": {}}'
+        res = cu.parse_action_xml(text)
         assert res["action_type"] == "send_message", f"Failed fallback: {res.get('action_type')}"
-    run_check("Unknown action_type falls back to send_message", t3_4)
+        # Action falls back, but text is still trusted because the JSON parsed cleanly.
+        assert res["text"] == "hello", res["text"]
+    run_check("Unknown action_type falls back to send_message; valid text preserved", t3_4)
     def t3_5():
         cu = get_client_utils()
         res = cu.parse_action_xml("")
         assert res["action_type"] == "send_message", f"Failed fallback: {res.get('action_type')}"
-    run_check("Completely empty string falls back to send_message", t3_5)
+        assert res["text"] == "", f"Empty input must produce empty text, got {res.get('text')!r}"
+    run_check("Completely empty string falls back to send_message with empty text", t3_5)
     def t3_6():
         cu = get_client_utils()
-        xml = "<action_type>offer_emi</action_type>\n<text>Hey</text>\n<metadata>{bad json}</metadata>"
-        res = cu.parse_action_xml(xml)
-        assert res["metadata"] == {}, f"Got {res.get('metadata')}"
-    run_check("metadata JSON parse error falls back to empty dict {}", t3_6)
+        # Trailing comma is invalid JSON — whole object rejected, safe fallback.
+        text = '{"action_type": "offer_emi", "text": "Hey", "metadata": {}, }'
+        res = cu.parse_action_xml(text)
+        assert res["action_type"] == "send_message", f"Got {res.get('action_type')}"
+        assert res["text"] == "", f"Malformed JSON must NOT leak raw input as text, got {res.get('text')!r}"
+    run_check("Malformed JSON (trailing comma) falls back safely without leaking raw input", t3_6)
     def t3_7():
         cu = get_client_utils()
-        xml = "<action_type>offer_emi</action_type>\n<text>Half"
-        res = cu.parse_action_xml(xml)
-    run_check("Truncated mid-tag output handled without exception", t3_7)
+        # No closing brace at all — extractor regex fails to match.
+        text = '{"action_type": "offer_emi", "text": "Half'
+        res = cu.parse_action_xml(text)  # must not raise
+        assert res["text"] == "", "Truncated JSON must produce empty text"
+    run_check("Truncated mid-key output handled without exception, no leak", t3_7)
     print("\nSECTION 4 — PROMPT BUILDER")
     def t4_1():
         c = get_contracts()
@@ -239,8 +253,14 @@ def run_all_tests():
     def t4_3():
         pb = get_prompting()
         prompt = pb.build_system_prompt()
-        assert "<action_type>" in prompt, "Missing XML formatting instructions"
-    run_check("build_system_prompt() contains XML format instruction", t4_3)
+        # The contract is now JSON — system prompt must instruct the model
+        # to emit a single JSON object with action_type / text / metadata
+        # / thought_process keys.
+        assert '"action_type"' in prompt, "Missing 'action_type' key in JSON contract"
+        assert '"text"' in prompt, "Missing 'text' key in JSON contract"
+        assert '"thought_process"' in prompt, "Missing 'thought_process' (private monologue) key"
+        assert "JSON" in prompt, "Missing JSON contract instruction"
+    run_check("build_system_prompt() contains JSON format instruction with all four keys", t4_3)
     def t4_4():
         pb = get_prompting()
         obs = {"borrower_message": "hi", "turns_remaining": 5, "escalation_level": 1, "stated_demands": []}
@@ -259,11 +279,21 @@ def run_all_tests():
     def t4_6():
         pb = get_prompting()
         obs = {"borrower_message": "hi", "turns_remaining": 5, "escalation_level": 1, "stated_demands": []}
-        history = [{"role": "agent", "content": "<action_type>send_message</action_type><text>raw content</text>"}]
+        # Simulates a previous-run completion that was logged verbatim into
+        # history (raw JSON). The prompt builder must surface the human-readable
+        # `text` value and NOT splat the JSON envelope into the prompt.
+        sentinel_keys = '{"action_type": "send_message", "text": "raw content", "metadata": {}}'
+        history = [{"role": "agent", "content": sentinel_keys}]
         prompt = pb.build_turn_prompt(obs, history)
-        assert "action_type" not in prompt, "Raw XML tags leaked"
-        assert "raw content" in prompt, "Clean content missing"
-    run_check("history entries show clean text not raw XML tags", t4_6)
+        # Inspect only the CONVERSATION HISTORY block — the system prompt
+        # legitimately mentions JSON keys to instruct the model on the output
+        # contract, so we must not flag those as leaks.
+        assert "CONVERSATION HISTORY" in prompt, "History block missing"
+        history_block = prompt.split("CONVERSATION HISTORY", 1)[1].split("CURRENT TURN", 1)[0]
+        assert "raw content" in history_block, "Clean content missing from history"
+        assert "{" not in history_block, "Raw JSON envelope leaked into history block"
+        assert '"action_type"' not in history_block, "JSON key leaked into history block"
+    run_check("history entries show clean text not raw JSON envelope", t4_6)
     def t4_7():
         pb = get_prompting()
         obs = {"borrower_message": "hi", "turns_remaining": 5, "escalation_level": 1, "stated_demands": []}
@@ -282,7 +312,7 @@ def run_all_tests():
         ro = get_rollout()
         ec = get_env_client()
         client = ec.DummyEnvClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=3, curriculum_stage="stage_1")
         assert isinstance(traj, dict)
     run_check("run_episode() completes without error against DummyEnvClient", t5_1)
@@ -290,7 +320,7 @@ def run_all_tests():
         ro = get_rollout()
         ec = get_env_client()
         client = ec.DummyEnvClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=3)
         req_keys = ["prompts", "completions", "rewards", "total_score", "success", 
                     "turns_taken", "reward_breakdown", "parse_failures", 
@@ -302,7 +332,7 @@ def run_all_tests():
         ro = get_rollout()
         ec = get_env_client()
         client = ec.DummyEnvClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=3)
         tt = traj["turns_taken"]
         assert len(traj["prompts"]) == tt, f"mismatched prompts length: {len(traj['prompts'])}"
@@ -322,7 +352,7 @@ def run_all_tests():
                 self.first_msg = obs.get("borrower_message", "")
                 return obs
         client = InspectClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=3)
         if traj["turns_taken"] > 1:
             assert "CONVERSATION HISTORY" in traj["prompts"][1]
@@ -340,7 +370,7 @@ def run_all_tests():
                 self.received_stage = curriculum_stage
                 return super().reset(curriculum_stage=curriculum_stage, **kwargs)
         client = StageClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         ro.run_episode(client, fake_llm, max_turns=3, curriculum_stage="stage_3")
         assert client.received_stage == "stage_3", f"Got: {client.received_stage}"
     run_check("curriculum stage forwarded to client.reset()", t5_5)
@@ -356,7 +386,7 @@ def run_all_tests():
                 info["reward_breakdown"]["test_accum"] = info["reward_breakdown"].get("test_accum", 0.0) + 1.0
                 return obs, r, d, info
         client = AccumulatingClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=3)
         val = traj["reward_breakdown"].get("test_accum", 0.0)
         assert val > 1.0, f"Expected accumulation > 1.0, got {val}"
@@ -365,7 +395,7 @@ def run_all_tests():
         ro = get_rollout()
         ec = get_env_client()
         client = ec.DummyEnvClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=4)
         assert "termination_reason" in traj["last_info"], "Missing termination_reason"
     run_check("last_info contains termination_reason", t5_7)
@@ -373,15 +403,15 @@ def run_all_tests():
         ro = get_rollout()
         ec = get_env_client()
         client = ec.DummyEnvClient()
-        def fake_llm(p): return "Just plain text, no tags whatsoever"
+        def fake_llm(p): return "Just plain prose, no JSON object at all"
         traj = ro.run_episode(client, fake_llm, max_turns=2)
         assert traj["parse_failures"] > 0, f"Failures counted: {traj['parse_failures']}"
-    run_check("parse_failures increments when XML tags are missing", t5_8)
+    run_check("parse_failures increments when JSON contract is broken", t5_8)
     def t5_9():
         ro = get_rollout()
         ec = get_env_client()
         client = ec.DummyEnvClient()
-        def fake_llm(p): return "<action_type>send_message</action_type>\n<text>hi</text>\n<metadata>{}</metadata>"
+        def fake_llm(p): return '{"action_type": "send_message", "text": "hi", "metadata": {}}'
         traj = ro.run_episode(client, fake_llm, max_turns=3)
         assert abs(traj["total_score"] - sum(traj["rewards"])) < 1e-6
     run_check("total_score equals sum of rewards list", t5_9)
@@ -403,8 +433,8 @@ def run_all_tests():
         fn = rb.make_env_reward_fn(client)
         obs_batch = rb.reset_env_for_batch(client, batch_size=2)
         comps = [
-            [{'content': '<action_type>offer</action_type>\n<text>hi</text>\n<metadata>{}</metadata>'}],
-            [{'content': '<action_type>offer</action_type>\n<text>hi2</text>\n<metadata>{}</metadata>'}]
+            [{'content': '{"action_type": "offer_emi", "text": "hi", "metadata": {"emi_amount": 1500}}'}],
+            [{'content': '{"action_type": "offer_emi", "text": "hi2", "metadata": {"emi_amount": 1500}}'}]
         ]
         rewards = fn(prompts=[], completions=comps, env_obs=obs_batch)
         assert isinstance(rewards, list), type(rewards)
@@ -419,8 +449,8 @@ def run_all_tests():
         fn = rb.make_env_reward_fn(client)
         obs_batch = rb.reset_env_for_batch(client, batch_size=2)
         comps = [
-            [{'content': '<action_type>offer</action_type>\n<text>hi</text>\n<metadata>{}</metadata>'}],
-            [{'content': '<action_type>offer</action_type>\n<text>hi</text>\n<metadata>{}</metadata>'}]
+            [{'content': '{"action_type": "send_message", "text": "hi", "metadata": {}}'}],
+            [{'content': '{"action_type": "send_message", "text": "hi", "metadata": {}}'}]
         ]
         rewards = fn(prompts=[], completions=comps, env_obs=obs_batch)
         rmin, rmax = c.NUMERIC_RANGES["reward_per_step"]
@@ -441,8 +471,8 @@ def run_all_tests():
         fn = rb.make_env_reward_fn(client)
         obs_batch = rb.reset_env_for_batch(client, batch_size=2)
         comps = [
-            [{'content': '<action_type>offer</action_type>\n<text>hi</text>\n<metadata>{}</metadata>'}],
-            [{'content': '<action_type>offer</action_type>\n<text>CRASH</text>\n<metadata>{}</metadata>'}]
+            [{'content': '{"action_type": "send_message", "text": "hi", "metadata": {}}'}],
+            [{'content': '{"action_type": "send_message", "text": "CRASH", "metadata": {}}'}]
         ]
         rewards = fn(prompts=[], completions=comps, env_obs=obs_batch)
         assert len(rewards) == 2

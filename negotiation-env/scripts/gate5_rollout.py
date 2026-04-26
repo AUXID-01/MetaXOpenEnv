@@ -6,11 +6,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from client.env_client import NegotiationEnvClient
 from training.rollout import run_episode
 
-BASE_URL = "https://auxid01-metaxopenenv.hf.space"
+BASE_URL = os.getenv("NEGOTIATION_ENV_URL", "https://auxid01-metaxopenenv.hf.space")
 client = NegotiationEnvClient(BASE_URL)
 
-# Dummy model — no LLM yet
-dummy = lambda p: "<action_type>send_message</action_type>\n<text>I understand your situation and want to help you find a solution.</text>\n<metadata>{}</metadata>"
+# Dummy model — no LLM yet. Emits a valid JSON object per the new contract.
+dummy = lambda p: '{"action_type": "send_message", "text": "I understand your situation and want to help you find a solution.", "metadata": {}}'
 
 print("=== 5 EPISODE DUMMY ROLLOUT ===\n")
 

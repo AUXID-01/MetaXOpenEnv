@@ -8,16 +8,19 @@ from client.env_client import DummyEnvClient
 from training.rollout import run_episode
 
 def mock_unsloth_generate(prompt: str) -> str:
+    """Mocks the messy output of a real base model for the smoke test.
+
+    We deliberately wrap the JSON object in chatty preamble and a postscript
+    so the parser's greedy ``{.*}`` regex has to skip both. The contract is
+    JSON: action_type / text / metadata at the top level, plus the optional
+    private ``thought_process`` field.
     """
-    Mocking the messy output of a real base model for the smoke test.
-    We inject extra text and malformed XML tags to prove our parser handles it via fallbacks.
-    """
-    # Let's say the base model hallucinates extra thoughts before the tag:
     return """
-I think the borrower is stressed. I will offer an EMI.
-<action_type>offer_emi</action_type>
-<text>I hear you completely. How about a 1800 EMI for 6 months?</text>
-<metadata>{"emi_amount": 1800}</metadata>
+Sure, here is my plan:
+{"thought_process": "Borrower sounds stressed; offer a softer EMI to drop anger.",
+ "action_type": "offer_emi",
+ "text": "I hear you completely. How about a 1800 EMI for 6 months?",
+ "metadata": {"emi_amount": 1800}}
 Hope this helps!
 """
 
@@ -38,8 +41,8 @@ def test_gate4():
     print(trajectory["completions"][0])
     print("-----------------------------------------")
     
-    # We verify the parser successfully extracted everything despite the messy output
-    assert trajectory["parse_failures"] == 0, "Parser failed to locate the XML tags in messy output!"
+    # We verify the parser successfully extracted everything despite the messy output.
+    assert trajectory["parse_failures"] == 0, "Parser failed to locate the JSON object in messy output!"
     
     print("\n[x] Gate 4 Complete! Cell 6 Smoke test logic executed flawlessly.")
 

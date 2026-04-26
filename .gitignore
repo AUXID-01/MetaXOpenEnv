@@ -1,0 +1,39 @@
+# =============================================================================
+# .gitignore — keep secrets, build artefacts, and venvs out of version control.
+# =============================================================================
+
+# ---- Secrets (NEVER commit) -------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtual environments ---------------------------------------------------
+.venv/
+venv/
+env/
+.python-version
+
+# ---- ML / training artefacts ------------------------------------------------
+wandb/
+grpo-debt-negotiator/
+negotiation-env/grpo-debt-negotiator/
+negotiation-env/.gpu_pipeline_test_out/
+*.ckpt
+*.safetensors
+*.bin
+.cache/
+
+# ---- Editor / OS noise ------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp

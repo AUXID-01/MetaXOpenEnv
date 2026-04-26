@@ -627,36 +627,66 @@ def reward_anti_exploit(prev_state: State, curr_state: State, action: Action) ->
 # Added for Format Compliancy (Addresses: Problem 1)
 # ===========================================================================
 
+import json as _json
+
+# Mirror the extractor in client/utils.action_from_text so the scorer grades
+# the same JSON object the parser will accept.  Greedy on purpose: we want
+# the outermost {...} even when the model wraps it in markdown fences.
+_JSON_SNIFFER_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
 def reward_format_compliance(action: Action) -> float:
+    """JSON-format compliance reward.
+
+    Grades the LLM's raw completion (preserved in
+    ``action.metadata["raw_text"]`` by ``client.utils.action_from_text``)
+    against the JSON contract specified in
+    ``training.prompt_builder.build_system_prompt``::
+
+        {"thought_process": ..., "action_type": ..., "text": ..., "metadata": {}}
+
+    Scoring (additive)
+    ------------------
+    +0.15  valid JSON decoded **and** has both ``action_type`` and ``text``
+    +0.05  ``action_type`` value is in :data:`VALID_ACTIONS`
+    -0.25  JSON decoding fails  **OR**  decoded JSON lacks the ``text`` key
+
+    A successful parse with ``text`` present but ``action_type`` missing
+    yields 0.0 — neither bonus applies, but the ``-0.25`` penalty does
+    not trigger because the user-spec only conditions it on JSON-decode
+    failure or missing ``text``.
+
+    The function is deterministic, has no I/O, and runs in O(n) on the
+    raw_text length (a single regex scan + one ``json.loads`` call), so
+    it stays well inside the per-step budget on the GRPO hot path.
     """
-    Format compliance reward. Evaluates the LLM's raw text generation.
-    Scoring rules:
-      Both <action_type> and <text> tags present  → +0.15
-      Exactly one of the two tags present         →  0.00
-      Neither tag present (pure prose output)     → -0.25
-      Additionally, if action_type is valid       → +0.05 bonus
-    """
-    # Addresses: Problem 1
     raw_text = (action.metadata or {}).get("raw_text", "")
-    has_action_type = "<action_type>" in raw_text.lower()
-    has_text = "<text>" in raw_text.lower()
-    
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return -0.25
+
+    match = _JSON_SNIFFER_RE.search(raw_text)
+    if not match:
+        return -0.25
+
+    try:
+        parsed = _json.loads(match.group(0))
+    except _json.JSONDecodeError:
+        return -0.25
+
+    if not isinstance(parsed, dict):
+        return -0.25
+
+    if "text" not in parsed:
+        return -0.25
+
     reward = 0.0
-    if has_action_type and has_text:
+    if "action_type" in parsed and "text" in parsed:
         reward += 0.15
-        
-        # Check valid action purely on raw text, ignoring fallback
-        import re
-        action_match = re.search(r'<action_type>(.*?)</action_type>', raw_text, re.IGNORECASE)
-        if action_match:
-            parsed_type = action_match.group(1).strip()
-            if parsed_type in VALID_ACTIONS:
-                reward += 0.05
-    elif (has_action_type and not has_text) or (has_text and not has_action_type):
-        reward += 0.0
-    else:
-        reward -= 0.25
-        
+
+    action_type_val = parsed.get("action_type")
+    if isinstance(action_type_val, str) and action_type_val.strip() in VALID_ACTIONS:
+        reward += 0.05
+
     return reward
 
 # ===========================================================================
@@ -669,79 +699,186 @@ def compose(
     action: Action,
     weights: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, Any]]:
-    """
-    Combiner: calls all seven reward functions, applies curriculum weights,
-    and returns the weighted scalar for GRPOTrainer alongside a per-component
-    breakdown dict for wandb per-column reward monitoring.
+    """Fast-Hybrid combiner — deterministic gates + LLM-judged soft skills.
 
-    This is the function Person A calls from env.step():
-        total_reward, breakdown = compose(state_before, state_after, action)
+    Pipeline:
 
-    The breakdown dict keys exactly match REWARD_BREAKDOWN_KEYS from
-    contracts.py ("outcome", "deescalation", "trust_building",
-    "demand_coverage", "efficiency", "compliance", "anti_exploit"),
-    so Person C's wandb logging picks them up with zero extra wiring.
+    1. **Cheap deterministic raws first.** Outcome, demand-coverage,
+       efficiency, anti-exploit, format-compliance, RBI/compliance — all
+       computed from State + Action with zero network I/O. These are
+       cheap (microseconds) and *always* run.
+
+    2. **Short-circuit gate.** If either of the deterministic gates has
+       already condemned the turn — broken JSON (``format_compliance < 0``)
+       or RBI-forbidden words (``compliance < 0``) — we skip the LLM
+       judge entirely. The LLM-dependent metrics (``deescalation`` and
+       ``trust_building``) are forced to 0.0 so that a malformed turn
+       cannot cherry-pick empathy bonuses while the deterministic
+       penalties are also firing. This keeps GRPO honest and saves an
+       entire NIM round-trip per failing completion.
+
+    3. **Qualitative replacement.** When the deterministic gates pass,
+       we ask :mod:`environment.llm_judge` to score the agent's reply
+       on (empathy, strategy). The judge's clamped [0,1] outputs *replace*
+       the legacy deterministic deescalation / trust_building values for
+       this turn:
+
+         * ``empathy_score``  →  ``deescalation``
+         * ``strategy_score`` →  ``trust_building``
+
+       The judge is engineered to never raise — on disabled / timeout /
+       malformed output it returns 0.0 / 0.0 with ``fallback_used=True``.
+       That fallback rate is surfaced in the breakdown for monitoring.
 
     Args:
         prev_state : State before the action was applied (state_before).
         curr_state : State after the adversary reacted (state_after).
-        action     : The Action the LLM sent this turn.
+        action     : The Action the LLM sent this turn. Optional context
+                     for the judge can be passed via ``action.metadata``:
+                       * ``borrower_msg``        — most recent borrower line
+                       * ``conversation_history``— list of {agent, borrower}
         weights    : Optional weight dict keyed by REWARD_BREAKDOWN_KEYS.
                      Missing keys fall back to _DEFAULT_WEIGHTS (stage_3).
                      Pass CURRICULUM_WEIGHTS["stage_N"] directly here.
 
     Returns:
-        (scalar_reward, breakdown)
+        ``(scalar_reward, breakdown)`` — signature is preserved so the
+        GRPOTrainer integration is unchanged.
 
         scalar_reward — weighted sum (float) — this goes into GRPOTrainer.
         breakdown     — dict with keys:
+            <component>          → raw component value (matches contract)
             raw_<component>      → unweighted component value
             weighted_<component> → weight * raw value
             weight_<component>   → weight applied
             total                → scalar_reward  (convenience copy)
 
-        The raw component values (without "raw_" prefix) are also written
-        directly into breakdown so that code reading
-        breakdown["outcome"] gets the raw value — matching the shape
-        Person A documented in StepResult.info["reward_breakdown"].
+            Plus diagnostic-only keys for the judge:
+            judge_used           → bool: True if judge actually ran
+            judge_reason         → str:  "ok" | "disabled" | "short_circuit" | …
+            judge_latency_ms     → float
+            judge_empathy        → float in [0,1]    (raw judge output)
+            judge_strategy       → float in [0,1]    (raw judge output)
+
+        These ``judge_*`` keys live alongside the existing breakdown but
+        are intentionally NOT in REWARD_BREAKDOWN_KEYS so they don't
+        accidentally feed back into the weighted sum.
     """
     resolved_weights: dict[str, float] = {**_DEFAULT_WEIGHTS, **(weights or {})}
-    resolved_weights["format_compliance"] = 0.5 # Reduced weight to prevent dominant strategy
+    resolved_weights["format_compliance"] = 0.5  # reduced to prevent dominant strategy
 
-    # ---- Raw component values -----------------------------------------------
+    # ── Step 1: deterministic raws (always run, cheap) ──────────────────────
     raw: dict[str, float] = {
-        "outcome":        reward_outcome(prev_state, curr_state, action),
-        "deescalation":   reward_deescalation(prev_state, curr_state, action),
-        "trust_building": reward_trust_building(prev_state, curr_state, action),
-        "demand_coverage":reward_demand_coverage(prev_state, curr_state, action),
-        "efficiency":     reward_efficiency(prev_state, curr_state, action),
-        "compliance":     reward_compliance(prev_state, curr_state, action),
-        "anti_exploit":   reward_anti_exploit(prev_state, curr_state, action),
-        "format_compliance": reward_format_compliance(action), # Addresses: Problem 1
+        "outcome":           reward_outcome(prev_state, curr_state, action),
+        "demand_coverage":   reward_demand_coverage(prev_state, curr_state, action),
+        "efficiency":        reward_efficiency(prev_state, curr_state, action),
+        "compliance":        reward_compliance(prev_state, curr_state, action),
+        "anti_exploit":      reward_anti_exploit(prev_state, curr_state, action),
+        "format_compliance": reward_format_compliance(action),
+        # Placeholders — populated below either by the short-circuit branch
+        # (zeroed) or by the LLM judge branch (replaced with judge scores).
+        "deescalation":   0.0,
+        "trust_building": 0.0,
     }
 
-    # ---- Verify all REWARD_BREAKDOWN_KEYS are present -----------------------
+    # ── Step 2: short-circuit gate ──────────────────────────────────────────
+    #
+    # The two cheap "format guards" act as kill-switches for the qualitative
+    # signal. We deliberately use strict "< 0" so a zero score from a benign
+    # turn (no penalty, no reward) still flows into the judge; only an
+    # actively penalised turn forfeits its empathy/strategy budget.
+    short_circuited = (raw["format_compliance"] < 0.0) or (raw["compliance"] < 0.0)
+
+    judge_used = False
+    judge_reason = "short_circuit" if short_circuited else "pending"
+    judge_latency_ms = 0.0
+    judge_empathy_raw = 0.0
+    judge_strategy_raw = 0.0
+    judge_fallback_used = True  # default; flipped below on success
+
+    if short_circuited:
+        # Deterministic gate failed — keep deescalation / trust_building at 0.0
+        # and DO NOT call the LLM judge. This is the optimisation that makes
+        # the Fast-Hybrid system viable on a hot training loop.
+        pass
+    else:
+        # ── Step 3: qualitative replacement ─────────────────────────────────
+        #
+        # Pull optional context out of action.metadata. We import lazily so
+        # the (already very chatty) reward.py module does not pay for the
+        # judge module on import — and so the test suite can monkey-patch
+        # `environment.llm_judge.score_response` cleanly.
+        try:
+            from environment import llm_judge as _llm_judge   # type: ignore
+        except Exception as exc:                              # pragma: no cover
+            _llm_judge = None  # type: ignore[assignment]
+            judge_reason = f"import_error:{type(exc).__name__}"
+
+        if _llm_judge is not None:
+            meta = action.metadata or {}
+            borrower_msg = ""
+            history = None
+            if isinstance(meta, dict):
+                bm = meta.get("borrower_msg") or meta.get("borrower_message")
+                if isinstance(bm, str):
+                    borrower_msg = bm
+                hist = meta.get("conversation_history")
+                if isinstance(hist, list):
+                    history = hist
+
+            try:
+                score = _llm_judge.score_response(
+                    agent_text=action.text or "",
+                    borrower_msg=borrower_msg,
+                    history=history,
+                )
+            except Exception as exc:                          # pragma: no cover
+                # llm_judge is hardened to never raise, but belt-and-braces:
+                # if it ever does, treat the turn as a soft fallback rather
+                # than blowing up the whole rollout.
+                judge_reason = f"judge_exception:{type(exc).__name__}"
+            else:
+                judge_empathy_raw = float(score.empathy_score)
+                judge_strategy_raw = float(score.strategy_score)
+                judge_latency_ms = float(score.latency_ms)
+                judge_fallback_used = bool(score.fallback_used)
+                judge_reason = score.reason
+                judge_used = not score.fallback_used
+
+                # Map judge scores onto the deterministic slots. We keep the
+                # raw values so wandb can compare deterministic-vs-judge.
+                raw["deescalation"] = judge_empathy_raw
+                raw["trust_building"] = judge_strategy_raw
+
+    # ── Step 4: contract enforcement & weighted sum ─────────────────────────
     for key in REWARD_BREAKDOWN_KEYS:
         assert key in raw, (
             f"reward.py bug: missing key '{key}' — must match REWARD_BREAKDOWN_KEYS"
         )
 
-    # ---- Weighted sum -------------------------------------------------------
     total = sum(resolved_weights.get(k, 0.0) * raw[k] for k in raw)
 
-    # ---- Build monitoring breakdown dict ------------------------------------
     breakdown: dict[str, Any] = {}
 
-    # Raw values at top-level (matches StepResult.info["reward_breakdown"] contract)
+    # Raw values at top-level (matches StepResult.info["reward_breakdown"] contract).
     for component, raw_val in raw.items():
         breakdown[component] = raw_val
 
-    # Detailed per-component monitoring columns (for wandb)
+    # Detailed per-component monitoring columns (for wandb).
     for component, raw_val in raw.items():
         w = resolved_weights.get(component, 0.0)
         breakdown[f"raw_{component}"] = raw_val
         breakdown[f"weight_{component}"] = w
         breakdown[f"weighted_{component}"] = w * raw_val
+
+    # Judge diagnostics — purely informational, never fed back into the sum.
+    breakdown["judge_used"] = judge_used
+    breakdown["judge_reason"] = judge_reason
+    breakdown["judge_latency_ms"] = judge_latency_ms
+    breakdown["judge_empathy"] = judge_empathy_raw
+    breakdown["judge_strategy"] = judge_strategy_raw
+    breakdown["judge_fallback_used"] = judge_fallback_used
+    breakdown["judge_short_circuited"] = short_circuited
 
     breakdown["total"] = total
 

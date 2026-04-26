@@ -22,6 +22,8 @@ pnpm-debug.log*
 .env
 .env.*
 *.env
+# But keep the canonical template tracked so new contributors can clone-and-go.
+!.env.example
 
 # ----------------------
 # Dependency directories

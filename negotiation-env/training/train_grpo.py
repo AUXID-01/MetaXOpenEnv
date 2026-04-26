@@ -53,8 +53,24 @@ tokenizer.truncation_side = "left"
 # %% [markdown]
 # ### Cell 5 — Client Setup
 # %%
-from environment.env import NegotiationEnv
-client = NegotiationEnv() # Direct instance for zero-latency training
+# Use the FastAPI HTTP wrapper rather than the in-process NegotiationEnv:
+#
+#   • NegotiationEnv.reset() returns a Pydantic Observation object, but
+#     training/rollout.py expects a dict (it indexes obs["borrower_msg"]).
+#     Going through the HTTP layer JSON-serialises the Observation, which
+#     gives us the dict shape rollout.py wants.
+#   • Pulling the URL from $NEGOTIATION_ENV_URL keeps localhost out of the
+#     committed code so the same script runs unchanged in CI / Hugging
+#     Face Spaces / Kubernetes — just point the env var at the deployed
+#     server.
+#
+# Required: a FastAPI server (negotiation-env/api/app.py) running at the
+# configured URL. Start it locally with:
+#     cd negotiation-env && uvicorn api.app:app --port 8000
+from client.env_client import NegotiationEnvClient
+env_url = os.getenv("NEGOTIATION_ENV_URL", "http://127.0.0.1:8000")
+client = NegotiationEnvClient(env_url)
+print(f"[env] training client → {env_url}")
 
 # %% [markdown]
 # ### Pre-Cell 6: Generation Wrapper

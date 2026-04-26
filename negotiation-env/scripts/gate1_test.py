@@ -19,9 +19,9 @@ def test_gate1():
     print("\n=== TURN PROMPT ===")
     print(turn_prompt)
     
-    # Simple assertions to ensure correct formatting
-    assert "You are a professional debt collection agent" in sys_prompt
-    assert "<action_type>" in sys_prompt
+    # Simple assertions to ensure correct formatting (JSON contract).
+    assert "You are a professional" in sys_prompt
+    assert '"action_type"' in sys_prompt and '"text"' in sys_prompt and '"thought_process"' in sys_prompt
     assert "Turn: 1" in turn_prompt
     assert "I can't pay anything right now" in turn_prompt
     assert "need 3 month moratorium" in turn_prompt

@@ -8,8 +8,8 @@ from client.env_client import DummyEnvClient
 from training.rollout import run_episode
 
 def dummy_model(prompt: str) -> str:
-    """Mock LLM that always outputs a valid format."""
-    return "<action_type>send_message</action_type>\n<text>I hear you.</text>\n<metadata>{}</metadata>"
+    """Mock LLM that always outputs a valid JSON object per the contract."""
+    return '{"action_type": "send_message", "text": "I hear you.", "metadata": {}}'
 
 def test_gate3():
     print("Running Gate 3 Tests (Mock Rollout)...\n")

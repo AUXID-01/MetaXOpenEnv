@@ -17,7 +17,7 @@ print(f"Format Compliance Weight applied: {bd.get('weight_format_compliance')}")
 print("\n2. Testing rollout execution speed and print muting...")
 env = NegotiationEnv()
 def dummy_gen(prompt):
-    return "<action_type>send_message</action_type>\n<text>This is a fast test.</text>"
+    return '{"action_type": "send_message", "text": "This is a fast test.", "metadata": {}}'
 
 trajectory = run_episode(env, dummy_gen, stage=1, verbose=False)
 print("Rollout completed successfully without stdout spam.")

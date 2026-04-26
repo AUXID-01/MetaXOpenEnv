@@ -69,11 +69,14 @@ def run_episode(client, model_generate_fn, stage: int = 1,
         generated_text = model_generate_fn(prompt)
         trajectory["completions"].append(generated_text)
         
-        # 3. Parse action and track failures
+        # 3. Parse action and track failures.
+        # The contract is now JSON (see prompt_builder.build_system_prompt).
+        # action_from_text() returns text="" on every parse failure, so we
+        # use that as the canonical signal: empty text after parsing means
+        # the model failed to emit a valid JSON object with a "text" key.
         action_dict = action_from_text(generated_text)
-        if "<action_type>" not in generated_text:
-            # We track when the model completely misses semantic structure
-            trajectory["parse_failures"] += 1 
+        if not (action_dict.get("text") or "").strip():
+            trajectory["parse_failures"] += 1
             
         # 4. Step environment
         next_obs, reward, done, info = client.step(action_dict)
@@ -103,9 +106,30 @@ def run_episode(client, model_generate_fn, stage: int = 1,
             
         if "reward_breakdown" in info:
             for k, v in info["reward_breakdown"].items():
-                if not (k.startswith("weight_") or k.startswith("weighted_") or k.startswith("raw_")):
-                    trajectory["reward_breakdown"][k] = \
+                if k.startswith("weight_") or k.startswith("weighted_") or k.startswith("raw_"):
+                    # Per-turn weighting columns — wandb logs them per-step
+                    # (line 158 of train_grpo.py); summing them across the
+                    # episode would double-count.
+                    continue
+                # Diagnostic-only fields written by reward.compose() for the
+                # Fast-Hybrid LLM Judge. They are booleans / strings / a
+                # latency, NOT additive reward signals — accumulating them
+                # either crashes (str + float) or is meaningless. We carry
+                # the LAST value of the episode forward so wandb shows the
+                # final-turn snapshot, mirroring the pattern used for
+                # `final_anger` / `final_trust`.
+                if k in (
+                    "judge_used", "judge_reason", "judge_fallback_used",
+                    "judge_short_circuited", "judge_latency_ms",
+                    "judge_empathy", "judge_strategy",
+                ):
+                    trajectory["reward_breakdown"][k] = v
+                    continue
+                # Standard numeric reward components are accumulated.
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    trajectory["reward_breakdown"][k] = (
                         trajectory["reward_breakdown"].get(k, 0.0) + v
+                    )
             
         if done:
             trajectory["success"] = (info.get("termination_reason") == "commitment_reached")
