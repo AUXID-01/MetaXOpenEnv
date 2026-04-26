@@ -102,7 +102,10 @@ def action_from_text(generated_text: str) -> dict:
         action_type = "send_message"
 
     raw_text = parsed.get("text")
-    text = raw_text.strip() if isinstance(raw_text, str) else ""
+    if isinstance(raw_text, list):
+        text = "\n".join([str(item) for item in raw_text]).strip()
+    else:
+        text = raw_text.strip() if isinstance(raw_text, str) else ""
 
     metadata: dict = {"raw_text": generated_text}
 
