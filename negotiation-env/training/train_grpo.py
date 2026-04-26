@@ -48,6 +48,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     max_seq_length=max_seq_length,
     load_in_4bit=load_in_4bit,
 )
+tokenizer.truncation_side = "left"
 
 # %% [markdown]
 # ### Cell 5 — Client Setup
@@ -61,7 +62,7 @@ client = NegotiationEnv() # Direct instance for zero-latency training
 def generate_action(prompt: str) -> str:
     """Wrapper to generate text using the loaded unsloth model."""
     inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-    outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
+    outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
     return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0][len(prompt):]
 
 # %% [markdown]
@@ -76,6 +77,16 @@ trajectory = run_episode(client, generate_action, stage=CURRICULUM_STAGE)
 print(f"Turns taken: {trajectory['turns_taken']}")
 print(f"Total score: {trajectory['total_score']}")
 print(f"Format Fallbacks: {trajectory['parse_failures']}")
+
+# Addresses: Problem 4
+parse_failures = trajectory.get('parse_failures', 0)
+turns_taken = trajectory.get('turns_taken', 1)
+print(f"[SMOKE TEST] Format failure rate: {(parse_failures / max(1, turns_taken)) * 100:.1f}%")
+bd = trajectory.get('reward_breakdown', {})
+is_format_present = 'format_compliance' in bd
+print(f"format_compliance present in breakdown: {is_format_present}")
+if not is_format_present:
+    print("WARNING: format_compliance is missing from reward_breakdown! Task 1 did not wire correctly.")
 
 print("\n--- SAMPLE GENERATION (Turn 1 Baseline) ---")
 print("PROMPT IN:\n", trajectory["prompts"][0][:200], "...\n")
@@ -152,9 +163,9 @@ grpo_config = GRPOConfig(
     per_device_train_batch_size=4,
     gradient_accumulation_steps=2,
     learning_rate=1e-5,
-    max_new_tokens=150,
+    max_prompt_length=2048,
+    max_completion_length=200,
     num_generations=8,       # rollouts per prompt
-    temperature=0.7,
     beta=0.01,               # KL penalty — keep low initially
     logging_steps=10,
     save_steps=100,
@@ -181,7 +192,24 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
         train_dataset=buffer,
         reward_funcs=reward_fn_from_buffer,
     )
+    
+    # Addresses: Problem 4
+    if len(buffer) > 0:
+        print(f"Current step number: {step}")
+        print(f"Number of examples in the training buffer: {len(buffer)}")
+        print(f"Reward of the first example: {buffer[0]['reward']}")
+        all_rewards = buffer["reward"]
+        print(f"Min reward in buffer: {min(all_rewards)}")
+        print(f"Max reward in buffer: {max(all_rewards)}")
+    print("Starting GRPOTrainer.train()...")
+    
     trainer.train()
+    
+    # Addresses: Problem 4
+    print("GRPOTrainer.train() completed.")
+    mean_reward_computed = sum(reward_window) / max(1, len(reward_window))
+    print(f"Mean reward over last {len(reward_window)} episodes: {mean_reward_computed}")
+
     
     # 3. Check curriculum advance
     mean_reward_last_100 = sum(reward_window) / max(1, len(reward_window))

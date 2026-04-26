@@ -106,3 +106,12 @@ Cargo.lock
 *.bak
 *.cache
 *.pid
+
+# ----------------------
+# Machine Learning / AI
+# ----------------------
+wandb/
+unsloth_compiled_cache/
+grpo_source.txt
+config_dir.txt
+tmp/

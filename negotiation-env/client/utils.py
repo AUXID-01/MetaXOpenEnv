@@ -25,7 +25,6 @@ def action_from_text(generated_text: str) -> dict:
     Expected LLM output format (XML tags — NOT JSON):
     <action_type>offer_emi</action_type>
     <text>I understand your situation and want to help...</text>
-    <metadata>{"emi_amount": 1800}</metadata>
     
     Fallback on parse failure:
     {"action_type": "send_message", "text": <raw text>, "metadata": {}}
@@ -33,7 +32,7 @@ def action_from_text(generated_text: str) -> dict:
     action_dict = {
         "action_type": "send_message",
         "text": generated_text.strip(),
-        "metadata": {}
+        "metadata": {"raw_text": generated_text} # Addresses: Problem 1
     }
     
     # 1. Parse Action Type
@@ -44,23 +43,15 @@ def action_from_text(generated_text: str) -> dict:
             action_dict["action_type"] = parsed_type
         else:
             logger.warning(f"Invalid action_type parsed: '{parsed_type}'. Falling back to 'send_message'.")
+            action_dict["action_type"] = "send_message"
     else:
         logger.warning("Missing <action_type> tag. Falling back to 'send_message'.")
+        action_dict["action_type"] = "send_message"
 
     # 2. Parse Text
     text_match = re.search(r'<text>(.*?)</text>', generated_text, re.DOTALL | re.IGNORECASE)
     if text_match:
         action_dict["text"] = text_match.group(1).strip()
         
-    # 3. Parse Metadata
-    meta_match = re.search(r'<metadata>(.*?)</metadata>', generated_text, re.DOTALL | re.IGNORECASE)
-    if meta_match:
-        meta_str = meta_match.group(1).strip()
-        if meta_str:
-            try:
-                action_dict["metadata"] = json.loads(meta_str)
-            except json.JSONDecodeError:
-                logger.warning("Malformed metadata JSON inside XML tag. Defaulting to empty {}.")
-                
     return action_dict
 parse_action_xml = action_from_text

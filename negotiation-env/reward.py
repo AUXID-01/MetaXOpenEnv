@@ -623,6 +623,43 @@ def reward_anti_exploit(prev_state: State, curr_state: State, action: Action) ->
 
 
 # ===========================================================================
+# Function 8 — reward_format_compliance
+# Added for Format Compliancy (Addresses: Problem 1)
+# ===========================================================================
+
+def reward_format_compliance(action: Action) -> float:
+    """
+    Format compliance reward. Evaluates the LLM's raw text generation.
+    Scoring rules:
+      Both <action_type> and <text> tags present  → +0.15
+      Exactly one of the two tags present         →  0.00
+      Neither tag present (pure prose output)     → -0.25
+      Additionally, if action_type is valid       → +0.05 bonus
+    """
+    # Addresses: Problem 1
+    raw_text = (action.metadata or {}).get("raw_text", "")
+    has_action_type = "<action_type>" in raw_text.lower()
+    has_text = "<text>" in raw_text.lower()
+    
+    reward = 0.0
+    if has_action_type and has_text:
+        reward += 0.15
+        
+        # Check valid action purely on raw text, ignoring fallback
+        import re
+        action_match = re.search(r'<action_type>(.*?)</action_type>', raw_text, re.IGNORECASE)
+        if action_match:
+            parsed_type = action_match.group(1).strip()
+            if parsed_type in VALID_ACTIONS:
+                reward += 0.05
+    elif (has_action_type and not has_text) or (has_text and not has_action_type):
+        reward += 0.0
+    else:
+        reward -= 0.25
+        
+    return reward
+
+# ===========================================================================
 # Combiner — compose()   (also aliased as compute_reward for test compat)
 # ===========================================================================
 
@@ -669,6 +706,7 @@ def compose(
         Person A documented in StepResult.info["reward_breakdown"].
     """
     resolved_weights: dict[str, float] = {**_DEFAULT_WEIGHTS, **(weights or {})}
+    resolved_weights["format_compliance"] = 1.0 # Addresses: Problem 1
 
     # ---- Raw component values -----------------------------------------------
     raw: dict[str, float] = {
@@ -679,6 +717,7 @@ def compose(
         "efficiency":     reward_efficiency(prev_state, curr_state, action),
         "compliance":     reward_compliance(prev_state, curr_state, action),
         "anti_exploit":   reward_anti_exploit(prev_state, curr_state, action),
+        "format_compliance": reward_format_compliance(action), # Addresses: Problem 1
     }
 
     # ---- Verify all REWARD_BREAKDOWN_KEYS are present -----------------------
