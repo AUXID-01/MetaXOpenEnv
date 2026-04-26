@@ -189,4 +189,4 @@ for step in range(0, TRAIN_STEPS, ROLLOUT_EVERY):
     mean_reward_last_100 = sum(reward_window) / max(1, len(reward_window))
     if scheduler.advance_if_ready(mean_reward_last_100):
         print("Advancing curriculum stage!")
-        # CURRICULUM_STAGE += 1
+        CURRICULUM_STAGE += 1
